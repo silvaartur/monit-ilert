@@ -29,6 +29,14 @@
 #                       (default: https://api.ilert.com/api/v1/heartbeats)
 #   --no-heartbeat      nao configura heartbeat
 #   --gateway IP        host para o check de conectividade ICMP
+#   --swap-warn N       % de swap para warning (default 10)
+#   --swap-crit N       % de swap para critical (default 30)
+#   --auto-restart MODO safe (default) = reinicia nginx/apache/php-fpm/redis
+#                       all = inclui bancos e docker | none = so alerta.
+#                       Em qualquer modo o Monit desiste apos 3 restarts em
+#                       20 ciclos e escala SEV1 via ilert-giveup.sh.
+#   --ping-target IP    alvo externo de ICMP e DNS (default 1.1.1.1).
+#                       Use IP, nao nome: ping por nome vira dois testes num so.
 #   --ports LISTA       servicos TCP a checar. Formato de cada item:
 #                         nome:porta                  (host 127.0.0.1)
 #                         nome:host:porta
@@ -45,7 +53,7 @@
 #===============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.5.3"
 BIN_DIR="/usr/local/bin"
 ENV_FILE="/etc/ilert.env"
 API_URL="https://api.ilert.com/api/events"
@@ -71,7 +79,16 @@ ILERT_HEARTBEAT_KEY="${ILERT_HEARTBEAT_KEY:-}"
 ILERT_ENV="${ILERT_ENV:-prod}"
 SERVICES_ARG=""
 GATEWAY=""
+ILERT_SWAP_WARN="${ILERT_SWAP_WARN:-}"
+ILERT_SWAP_CRIT="${ILERT_SWAP_CRIT:-}"
 PORTS_ARG=""
+PING_TARGET="${ILERT_PING_TARGET:-1.1.1.1}"
+# Auto-restart: 'safe' = web/php/cache (stateless, restart barato)
+#               'all'  = inclui bancos e docker (leia o README antes)
+#               'none' = so alerta
+RESTART_MODE="${ILERT_RESTART_MODE:-safe}"
+RESTART_LIMIT="${ILERT_RESTART_LIMIT:-3}"
+RESTART_WINDOW="${ILERT_RESTART_WINDOW:-20}"
 ILERT_HOST="${ILERT_HOST:-}"
 ILERT_HEARTBEAT_URL="${ILERT_HEARTBEAT_URL:-}"
 ILERT_RESOLVE_DELAY="${ILERT_RESOLVE_DELAY:-}"
@@ -137,6 +154,10 @@ while [ $# -gt 0 ]; do
     --env)             ILERT_ENV="${2:?}"; shift ;;
     --services)        SERVICES_ARG="${2:?}"; shift ;;
     --gateway)         GATEWAY="${2:?}"; shift ;;
+    --ping-target)     PING_TARGET="${2:?}"; shift ;;
+    --auto-restart)    RESTART_MODE="${2:?}"; shift ;;
+    --swap-warn)       ILERT_SWAP_WARN="${2:?}"; shift ;;
+    --swap-crit)       ILERT_SWAP_CRIT="${2:?}"; shift ;;
     --ports)           PORTS_ARG="${2:?}"; shift ;;
     --host)            ILERT_HOST="${2:?}"; shift ;;
     --no-heartbeat)    WANT_HEARTBEAT=0 ;;
@@ -349,7 +370,8 @@ ENVN="\${ILERT_ENV:-prod}"
 # Nome exibido no ilert (alertKey e label 'host'). Default: hostname do
 # sistema; sobrescreva com ILERT_HOST em $ENV_FILE quando o hostname nao for
 # descritivo (ex.: ip-10-0-3-14 em nuvem).
-MONIT_HOST="\${ILERT_HOST:-\$MONIT_HOST}"
+_REAL_HOST="\$MONIT_HOST"          # nome que o Monit usa nos checks
+MONIT_HOST="\${ILERT_HOST:-\$MONIT_HOST}"   # nome exibido no ilert
 : "\${MONIT_SERVICE:=unknown}"
 : "\${MONIT_DESCRIPTION:=sem descricao}"
 : "\${MONIT_EVENT:=unknown}"
@@ -362,10 +384,27 @@ esc() { local s=\$1
   s=\${s//\$'\n'/\\\\n}; s=\${s//\$'\r'/\\\\r}; s=\${s//\$'\t'/\\\\t}
   printf '%s' "\$s"; }
 
+# O summary e o que aparece no push, no SMS e na lista de alertas. Sem o host,
+# "root: space usage 90.8%" nao diz QUAL maquina esta com o disco cheio. O
+# 'check system' ja usa o hostname como nome do check, entao ali o prefixo
+# seria redundante - dai o teste antes de prefixar.
+# Comparar com os DOIS nomes: o 'check system' usa o hostname real como nome do
+# check, entao com ILERT_HOST configurado a comparacao simples falharia e o
+# summary sairia "web-prod-01 / docker-01: ...", citando a mesma maquina duas
+# vezes com nomes diferentes.
+if [ "\$MONIT_SERVICE" = "\$MONIT_HOST" ] || [ "\$MONIT_SERVICE" = "\$_REAL_HOST" ]; then
+  # Usa o nome EXIBIDO, nao o do check: com ILERT_HOST configurado, sair
+  # "docker-01: swap" aqui e "web-prod-01 / root: disco" ali mostraria a mesma
+  # maquina com dois nomes na mesma lista de alertas.
+  SUMMARY="\$MONIT_HOST: \$MONIT_DESCRIPTION"
+else
+  SUMMARY="\$MONIT_HOST / \$MONIT_SERVICE: \$MONIT_DESCRIPTION"
+fi
+
 BODY="{\\"integrationKey\\":\\"\$KEY\\",
  \\"eventType\\":\\"\$EVT\\",
  \\"alertKey\\":\\"\$(esc "\$AKEY")\\",
- \\"summary\\":\\"\$(esc "\$MONIT_SERVICE: \$MONIT_DESCRIPTION")\\",
+ \\"summary\\":\\"\$(esc "\$SUMMARY")\\",
  \\"details\\":\\"\$(esc "\$MONIT_EVENT em \$MONIT_DATE")\\",
  \\"priority\\":\\"\$PRIO\\",
  \\"severity\\":\$SEV,
@@ -410,6 +449,45 @@ else
   logger -t ilert "falha HTTP \$CODE ao enviar \$EVT para \$AKEY"
   exit 1
 fi
+EOF
+
+  local MONIT_BIN_PATH
+  MONIT_BIN_PATH="$(command -v monit 2>/dev/null || echo /usr/bin/monit)"
+  write_file "$BIN_DIR/ilert-giveup.sh" 0700 <<EOF
+#!/bin/bash
+# Chamado pelo Monit quando um servico excede o limite de restarts.
+# Gerado por install-monit-ilert.sh v$SCRIPT_VERSION
+#
+# Reiniciar em loop e pior que nao reiniciar: mascara a causa, consome I/O e
+# pode corromper estado. Aqui a politica e desistir e escalar para um humano.
+#
+# uso: ilert-giveup.sh <nome-do-check>
+set -u
+SVC="\${1:?uso: ilert-giveup.sh <servico>}"
+
+MONIT_SERVICE="\$SVC" \\
+MONIT_DESCRIPTION="reiniciado varias vezes sem estabilizar - monitoramento suspenso, precisa de intervencao manual" \\
+MONIT_EVENT="Restart limit atingido" \\
+ILERT_RESOLVE_DELAY=0 \\
+  $BIN_DIR/ilert.sh ALERT HIGH 1 restartloop || true
+
+# 'monit unmonitor' fala com o proprio Monit pela interface HTTP local. Roda
+# destacado e com atraso para nao reentrar no ciclo que disparou este exec
+# (o Monit espera o programa terminar, com programTimeout de 30s).
+# Caminho absoluto: o Monit executa programas com PATH minimo.
+MONIT_BIN="$MONIT_BIN_PATH"
+[ -x "\$MONIT_BIN" ] || MONIT_BIN="\$(command -v monit 2>/dev/null || echo /usr/bin/monit)"
+# O atraso e essencial nas duas variantes: sem ele o unmonitor reentra no
+# ciclo que acabou de disparar este exec. Argumentos via "\$1"/"\$2" para nao
+# depender de escaping em nome de servico.
+if command -v setsid >/dev/null 2>&1; then
+  setsid bash -c 'sleep 10; "\$1" unmonitor "\$2"' _ "\$MONIT_BIN" "\$SVC" \\
+    >/dev/null 2>&1 < /dev/null &
+else
+  ( sleep 10; "\$MONIT_BIN" unmonitor "\$SVC" ) >/dev/null 2>&1 < /dev/null &
+fi
+disown 2>/dev/null || true
+exit 0
 EOF
 
   write_file "$BIN_DIR/ilert-flush.sh" 0700 <<EOF
@@ -514,12 +592,31 @@ compute_thresholds() {
   elif [ "$RAM_MB" -lt 8192 ]; then MEM_WARN=85; MEM_CRIT=94
   else MEM_WARN=88; MEM_CRIT=95; fi
 
+  # Swap e sinal, nao recurso: o que importa e swap que NAO volta, por isso o
+  # debounce longo no warning. Ajustavel para frotas com perfil diferente.
+  SWAP_WARN="${ILERT_SWAP_WARN:-10}"
+  SWAP_CRIT="${ILERT_SWAP_CRIT:-30}"
+  # Valores vindos de flag/env chegam sem garantia nenhuma. Um valor nao
+  # numerico produziria 'if swap usage > abc%', que so falharia la na frente no
+  # 'monit -t'; e warn >= crit geraria dois alertas simultaneos sempre.
+  [[ "$SWAP_WARN" =~ ^[0-9]+$ ]] && [ "$SWAP_WARN" -ge 1 ] && [ "$SWAP_WARN" -le 99 ] \
+    || { warn "swap warn invalido ($SWAP_WARN) - usando 10"; SWAP_WARN=10; }
+  [[ "$SWAP_CRIT" =~ ^[0-9]+$ ]] && [ "$SWAP_CRIT" -ge 1 ] && [ "$SWAP_CRIT" -le 100 ] \
+    || { warn "swap crit invalido ($SWAP_CRIT) - usando 30"; SWAP_CRIT=30; }
+  if [ "$SWAP_WARN" -ge "$SWAP_CRIT" ]; then
+    warn "swap warn ($SWAP_WARN%) >= crit ($SWAP_CRIT%) - ajustando para 10/30"
+    SWAP_WARN=10; SWAP_CRIT=30
+  fi
   HAS_SWAP=0
   if [ -n "$(swapon --show --noheadings 2>/dev/null || true)" ]; then HAS_SWAP=1; fi
 
   printf '  cores=%s -> loadavg(5min) warn>%s crit>%s\n' "$CORES" "$LOAD_WARN" "$LOAD_CRIT"
   printf '  RAM=%s MB -> memoria warn>%s%% crit>%s%%\n' "$RAM_MB" "$MEM_WARN" "$MEM_CRIT"
-  printf '  swap ativo: %s\n' "$( [ "$HAS_SWAP" -eq 1 ] && echo sim || echo nao)"
+  if [ "$HAS_SWAP" -eq 1 ]; then
+    printf '  swap ativo -> warn>%s%% crit>%s%%\n' "$SWAP_WARN" "$SWAP_CRIT"
+  else
+    printf '  swap ativo: nao\n'
+  fi
 }
 
 # limiares de disco derivados do tamanho: percentual + valor absoluto
@@ -598,6 +695,17 @@ EOF
 #------------------------------------------------------------------------------
 # helpers de geracao de checks
 #------------------------------------------------------------------------------
+# Politica de auto-restart. Monit tenta reiniciar sozinho e DESISTE se o
+# servico nao estabilizar - loop de restart mascara a causa e queima I/O.
+# A desistencia chama ilert-giveup.sh, que escala SEV1 e suspende o check.
+emit_restart_policy() { # emit_restart_policy <nome-do-check>
+  local svc="$1"
+  echo "  # auto-restart: tenta reerguer, mas desiste se virar loop"
+  echo "  if does not exist for 3 cycles then restart"
+  echo "  if $RESTART_LIMIT restarts within $RESTART_WINDOW cycles"
+  echo "    then exec \"$BIN_DIR/ilert-giveup.sh $svc\""
+}
+
 # emite par ALERT/RESOLVE
 emit_pair() { # emit_pair <condicao> <prio> <sev> <sufixo> [repeat_cycles]
   local cond="$1" prio="$2" sev="$3" sfx="$4" rep="${5:-}"
@@ -662,8 +770,8 @@ gen_system_checks() {
     if [ "$HAS_SWAP" -eq 1 ]; then
       echo
       echo "  # ---- SWAP (sinal, nao recurso: debounce longo de proposito) ----"
-      emit_pair "if swap usage > 20% for 3 cycles" HIGH 1 swap-crit 30
-      emit_pair "if swap usage > 5% for 10 cycles" HIGH 2 swap-warn 60
+      emit_pair "if swap usage > ${SWAP_CRIT}% for 3 cycles" HIGH 1 swap-crit 30
+      emit_pair "if swap usage > ${SWAP_WARN}% for 10 cycles" HIGH 2 swap-warn 60
     fi
   } > /tmp/00-system.conf
   write_file "$CONF_D/00-system.conf" 0600 < /tmp/00-system.conf
@@ -730,12 +838,68 @@ gen_network_checks() {
     echo "check host gateway with address $GATEWAY"
     emit_pair "if failed ping count 3 with timeout 5 seconds for 3 cycles" HIGH 1 icmp 30
     echo
-    echo "check host dns-externo with address 1.1.1.1"
+    echo "# Conectividade externa: alvo por IP, NAO por nome. Usar google.com"
+    echo "# aqui misturaria duas falhas diferentes (rede caiu x DNS quebrou) no"
+    echo "# mesmo alerta, e o Monit resolveria o nome a cada ciclo."
+    echo "check host internet with address $PING_TARGET"
     emit_pair "if failed ping count 3 with timeout 5 seconds for 5 cycles" HIGH 2 icmp 60
+    echo
+    echo "# Resolucao de nomes testada separadamente, falando DNS de verdade."
+    echo "check host dns with address $PING_TARGET"
+    emit_pair "if failed port 53 type udp protocol dns for 5 cycles" HIGH 2 dns 60
   } > /tmp/02-network.conf
   write_file "$CONF_D/02-network.conf" 0600 < /tmp/02-network.conf
   rm -f /tmp/02-network.conf
   ok "gateway: $GATEWAY"
+}
+
+# systemd com ProtectSystem=strict/full monta /run e /var somente-leitura para
+# o servico. Duas consequencias silenciosas:
+#   1. connect() em socket unix falha (exige escrita no arquivo do socket),
+#      gerando "Connection failed" com o servico saudavel;
+#   2. o ilert.sh nao consegue gravar os marcadores de resolve adiado, e o
+#      anti-flapping para de funcionar sem avisar.
+ensure_monit_sandbox() {
+  local prot
+  prot="$(systemctl show monit -p ProtectSystem --value 2>/dev/null || true)"
+  case "$prot" in
+    strict|full|yes) ;;
+    *) return 0 ;;
+  esac
+  head1 "9c. Sandbox do systemd"
+  warn "monit roda com ProtectSystem=$prot (/run e /var somente-leitura)"
+
+  # diretorios de socket realmente usados neste host.
+  # O prefixo '-' torna cada caminho OPCIONAL: sem ele, um diretorio que nao
+  # exista no momento do start impede o monit de iniciar
+  # ("Failed to set up mount namespacing"). Sockets em /run somem no boot.
+  local -a rw=("-/var/lib/ilert")
+  local d
+  for d in /run/php /run/mysqld /run/postgresql /run/redis /run/docker.sock; do
+    [ -e "$d" ] && rw+=("-$(dirname "$d/x")")
+  done
+  mapfile -t rw < <(printf '%s\n' "${rw[@]}" | sort -u)
+
+  run mkdir -p /var/lib/ilert/pending /etc/systemd/system/monit.service.d
+  write_file /etc/systemd/system/monit.service.d/ilert.conf 0644 <<EOF
+# Gerado por install-monit-ilert.sh v$SCRIPT_VERSION
+# Sem isto, com ProtectSystem=$prot, o Monit nao conecta em sockets unix e o
+# anti-flapping do ilert nao consegue gravar seus marcadores.
+[Service]
+ReadWritePaths=${rw[*]}
+EOF
+  run systemctl daemon-reload
+  ok "ReadWritePaths: ${rw[*]}"
+  # Um drop-in ruim so aparece no proximo start; melhor descobrir agora.
+  if [ "$DRY_RUN" -eq 0 ] && systemctl is-active --quiet monit; then
+    if ! systemctl restart monit || ! systemctl is-active --quiet monit; then
+      warn "monit nao subiu com o drop-in - removendo"
+      rm -f /etc/systemd/system/monit.service.d/ilert.conf
+      systemctl daemon-reload || true
+      systemctl start monit || true
+      warn "sockets unix podem falhar; veja 'systemctl status monit'"
+    fi
+  fi
 }
 
 gen_flush_check() {
@@ -840,6 +1004,19 @@ gen_service_checks() {
     echo
   } > "$out"
 
+  # quais servicos podem se reerguer sozinhos
+  restart_ok() {
+    case "$RESTART_MODE" in
+      none) return 1 ;;
+      all)  return 0 ;;
+      *)    case "$1" in
+              nginx|apache2|httpd|php*-fpm|redis|redis-server|valkey|valkey-server)
+                return 0 ;;
+              *) return 1 ;;
+            esac ;;
+    esac
+  }
+
   local s pid
   for s in "${CHOSEN[@]}"; do
     case "$s" in
@@ -851,6 +1028,7 @@ gen_service_checks() {
           echo "  start program = \"/bin/systemctl start nginx\" with timeout 60 seconds"
           echo "  stop  program = \"/bin/systemctl stop nginx\" with timeout 30 seconds"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
+          restart_ok "$s" && emit_restart_policy "$s"
           emit_pair "if failed port 80 protocol http request \"/\" for 3 cycles" HIGH 2 http 30
           emit_pair "if cpu > 80% for 10 cycles" HIGH 2 cpu 120
           echo
@@ -865,6 +1043,7 @@ gen_service_checks() {
           echo "  start program = \"/bin/systemctl start $s\" with timeout 60 seconds"
           echo "  stop  program = \"/bin/systemctl stop $s\" with timeout 30 seconds"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
+          restart_ok "$s" && emit_restart_policy "$s"
           emit_pair "if failed port 80 protocol http request \"/\" for 3 cycles" HIGH 2 http 30
           emit_pair "if children > 250 for 5 cycles" HIGH 2 children 120
           echo
@@ -880,6 +1059,7 @@ gen_service_checks() {
           echo "  stop  program = \"/bin/systemctl stop $s\" with timeout 90 seconds"
           echo "  # banco: nunca reinicie sozinho. Alerta e humano decide."
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
+          restart_ok "$s" && emit_restart_policy "$s"
           emit_pair "if failed host 127.0.0.1 port 3306 protocol mysql for 3 cycles" HIGH 1 port 30
           emit_pair "if memory > 70% for 10 cycles" HIGH 2 mem 120
           echo
@@ -894,6 +1074,7 @@ gen_service_checks() {
           echo "  start program = \"/bin/systemctl start postgresql\" with timeout 90 seconds"
           echo "  stop  program = \"/bin/systemctl stop postgresql\" with timeout 90 seconds"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
+          restart_ok "$s" && emit_restart_policy "$s"
           emit_pair "if failed host 127.0.0.1 port 5432 protocol pgsql for 3 cycles" HIGH 1 port 30
           emit_pair "if memory > 70% for 10 cycles" HIGH 2 mem 120
           echo
@@ -908,32 +1089,65 @@ gen_service_checks() {
           echo "  stop  program = \"/bin/systemctl stop docker\" with timeout 60 seconds"
           echo "  # sem restart automatico: derrubaria todos os containers"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
+          restart_ok "$s" && emit_restart_policy "$s"
           emit_pair "if failed unixsocket /var/run/docker.sock for 3 cycles" HIGH 1 socket 30
           echo
         } >> "$out"
         ;;
       php*-fpm)
-        local ver sock
+        local ver c
         ver="$(echo "$s" | sed 's/php\(.*\)-fpm/\1/')"
         pid="$(find_pidfile "${s}.service" "/run/php/php${ver}-fpm.pid" \
                "/run/php-fpm/php-fpm.pid" "/var/run/php/php${ver}-fpm.pid")" || pid=""
-        sock=""
-        local c
-        for c in "/run/php/php${ver}-fpm.sock" "/var/run/php/php${ver}-fpm.sock" \
-                 "/run/php-fpm/www.sock"; do
-          [ -S "$c" ] && { sock="$c"; break; }
-        done
+
+        # Um php-fpm pode ter VARIOS pools, cada um com seu socket ou porta.
+        # Adivinhar "/run/php/phpX.Y-fpm.sock" gera falso positivo quando os
+        # pools usam nomes proprios. A fonte da verdade sao os arquivos de pool.
+        local -a psocks=() pports=()
+        local pooldir="/etc/php/${ver}/fpm/pool.d"
+        [ -d "$pooldir" ] || pooldir="/etc/php-fpm.d"
+        if [ -d "$pooldir" ]; then
+          while read -r lv; do
+            case "$lv" in
+              /*)            [ -S "$lv" ] && psocks+=("$lv") ;;
+              *:[0-9]*)      pports+=("${lv##*:}") ;;
+              [0-9]*)        pports+=("$lv") ;;
+            esac
+          done < <(grep -hE '^[[:space:]]*listen[[:space:]]*=' "$pooldir"/*.conf 2>/dev/null \
+                   | sed 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//' \
+                   | sort -u || true)
+        fi
+        # fallback: caminhos convencionais, se nenhum pool foi lido
+        if [ ${#psocks[@]} -eq 0 ] && [ ${#pports[@]} -eq 0 ]; then
+          for c in "/run/php/php${ver}-fpm.sock" "/var/run/php/php${ver}-fpm.sock" \
+                   "/run/php-fpm/www.sock"; do
+            [ -S "$c" ] && { psocks+=("$c"); break; }
+          done
+        fi
         {
           if [ -n "$pid" ]; then echo "check process $s with pidfile $pid"
           else echo "check process $s matching \"php-fpm.*master.*${ver}\""; fi
           echo "  start program = \"/bin/systemctl start $s\" with timeout 60 seconds"
           echo "  stop  program = \"/bin/systemctl stop $s\" with timeout 30 seconds"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
-          if [ -n "$sock" ]; then
-            emit_pair "if failed unixsocket $sock for 3 cycles" HIGH 1 socket 30
-          else
-            echo "  # socket unix nao encontrado; se usar TCP, ajuste a linha abaixo"
-            echo "  # if failed host 127.0.0.1 port 9000 type tcp for 3 cycles then alert"
+          restart_ok "$s" && emit_restart_policy "$s"
+          local sname n=0
+          for c in ${psocks[@]+"${psocks[@]}"}; do
+            n=$((n + 1))
+            # printf sem newline: 'tr' converteria a quebra de linha num '_'
+            # extra, gerando sufixos como "sock_php8_2_fpm_".
+            sname="$(printf '%s' "$(basename "$c" .sock)" | tr -c 'a-zA-Z0-9_' '_')"
+            echo "  # pool: $c"
+            emit_pair "if failed unixsocket $c for 3 cycles" HIGH 1 "sock_${sname}" 30
+          done
+          for c in ${pports[@]+"${pports[@]}"}; do
+            echo "  # pool TCP: porta $c"
+            emit_pair "if failed host 127.0.0.1 port $c type tcp for 3 cycles" \
+              HIGH 1 "tcp_${c}" 30
+          done
+          if [ "$n" -eq 0 ] && [ ${#pports[@]} -eq 0 ]; then
+            echo "  # nenhum socket/porta de pool encontrado - so o PID e checado."
+            echo "  # Verifique 'listen =' em $pooldir/*.conf e adicione a mao."
           fi
           emit_pair "if children > 200 for 5 cycles" HIGH 2 children 120
           emit_pair "if total memory > 60% for 10 cycles" HIGH 2 mem 120
@@ -957,6 +1171,7 @@ gen_service_checks() {
           echo "  # sem restart automatico: se usado como cache com persistencia,"
           echo "  # reiniciar as cegas pode perder dados nao salvos no RDB/AOF"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
+          restart_ok "$s" && emit_restart_policy "$s"
           emit_pair "if failed host 127.0.0.1 port 6379 type tcp protocol redis for 3 cycles" \
             HIGH 1 port 30
           if [ -n "$rsock" ]; then
@@ -1229,6 +1444,7 @@ main() {
   gen_network_checks
   gen_heartbeat_check
   gen_flush_check
+  ensure_monit_sandbox
   detect_services
   gen_service_checks
   gen_port_checks
