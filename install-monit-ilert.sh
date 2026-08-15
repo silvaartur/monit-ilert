@@ -35,6 +35,9 @@
 #                       all = inclui bancos e docker | none = so alerta.
 #                       Em qualquer modo o Monit desiste apos 3 restarts em
 #                       20 ciclos e escala SEV1 via ilert-giveup.sh.
+#   --resolve-name NOME nome usado no teste de resolucao (default google.com)
+#   --connectivity MODO auto (default) = testa ICMP e usa TCP 443 se bloqueado
+#                       icmp | tcp | none
 #   --ping-target IP    alvo externo de ICMP e DNS (default 1.1.1.1).
 #                       Use IP, nao nome: ping por nome vira dois testes num so.
 #   --ports LISTA       servicos TCP a checar. Formato de cada item:
@@ -53,7 +56,7 @@
 #===============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="2.6.0"
+SCRIPT_VERSION="2.10.0"
 BIN_DIR="/usr/local/bin"
 ENV_FILE="/etc/ilert.env"
 API_URL="https://api.ilert.com/api/events"
@@ -87,6 +90,12 @@ PING_TARGET="${ILERT_PING_TARGET:-1.1.1.1}"
 #               'all'  = inclui bancos e docker (leia o README antes)
 #               'none' = so alerta
 RESTART_MODE="${ILERT_RESTART_MODE:-safe}"
+# auto  = testa ICMP na instalacao e cai para TCP 443 quando bloqueado
+# icmp  = forca ICMP | tcp = forca TCP 443 | none = sem check de rede
+CONNECTIVITY="${ILERT_CONNECTIVITY:-auto}"
+# Nome usado para validar a resolucao. Prefira um dominio de terceiro, estavel
+# e sem CDN geolocalizada esquisita.
+RESOLVE_NAME="${ILERT_RESOLVE_NAME:-google.com}"
 RESTART_LIMIT="${ILERT_RESTART_LIMIT:-3}"
 RESTART_WINDOW="${ILERT_RESTART_WINDOW:-20}"
 ILERT_HOST="${ILERT_HOST:-}"
@@ -155,6 +164,8 @@ while [ $# -gt 0 ]; do
     --services)        SERVICES_ARG="${2:?}"; shift ;;
     --gateway)         GATEWAY="${2:?}"; shift ;;
     --ping-target)     PING_TARGET="${2:?}"; shift ;;
+    --connectivity)    CONNECTIVITY="${2:?}"; shift ;;
+    --resolve-name)    RESOLVE_NAME="${2:?}"; shift ;;
     --auto-restart)    RESTART_MODE="${2:?}"; shift ;;
     --swap-warn)       ILERT_SWAP_WARN="${2:?}"; shift ;;
     --swap-crit)       ILERT_SWAP_CRIT="${2:?}"; shift ;;
@@ -490,6 +501,28 @@ disown 2>/dev/null || true
 exit 0
 EOF
 
+  write_file "$BIN_DIR/ilert-dns.sh" 0700 <<EOF
+#!/bin/bash
+# Testa a RESOLUCAO DE NOMES pelo caminho real do sistema.
+# Gerado por install-monit-ilert.sh v$SCRIPT_VERSION
+#
+# Por que nao "ping google.com": o ping junta resolucao e rota num teste so -
+# quando falha voce nao sabe qual dos dois quebrou. E por que nao basta
+# consultar 1.1.1.1 direto: isso testa o servidor remoto, nao o resolver DESTE
+# host (/etc/resolv.conf, systemd-resolved, nsswitch). 'getent hosts' passa
+# exatamente pelo mesmo caminho que a sua aplicacao usa.
+set -u
+NAME="\${1:-$RESOLVE_NAME}"
+IP="\$(getent hosts "\$NAME" 2>/dev/null | awk '{print \$1; exit}')"
+if [ -n "\$IP" ]; then
+  echo "\$NAME -> \$IP"
+  exit 0
+fi
+# stdout vira a descricao do alerta no ilert
+echo "falha ao resolver \$NAME - verifique /etc/resolv.conf ou systemd-resolved"
+exit 1
+EOF
+
   write_file "$BIN_DIR/ilert-flush.sh" 0700 <<EOF
 #!/bin/bash
 # Despacha os RESOLVE pendentes cujo servico ficou estavel.
@@ -621,13 +654,32 @@ compute_thresholds() {
 
 # limiares de disco derivados do tamanho: percentual + valor absoluto
 # regra: warn livre = 10%% do disco (min 2G, max 20G); crit = 3%% (min 1G, max 8G)
-disk_thresholds() { # $1 = tamanho em GB -> "pct_warn pct_crit gb_warn gb_crit"
-  local size="$1" gw gc
-  gw=$(( size / 10 )); [ "$gw" -lt 2 ] && gw=2; [ "$gw" -gt 20 ] && gw=20
-  gc=$(( size / 33 )); [ "$gc" -lt 1 ] && gc=1; [ "$gc" -gt 8 ] && gc=8
-  if [ "$size" -le 20 ]; then echo "80 90 $gw $gc"
-  elif [ "$size" -le 200 ]; then echo "85 93 $gw $gc"
-  else echo "88 95 $gw $gc"; fi
+# $1 = tamanho em GB -> "pct_warn pct_crit mb_warn mb_crit"
+#
+# Em MB, nao GB: um piso fixo de 2 GB fazia /boot (tipicamente 1-2 GB) alertar
+# desde o primeiro dia, sem nunca representar um problema real. Os limiares
+# absolutos agora escalam com o volume, com pisos pensados no uso pratico:
+# 512 MB no warning cobre a instalacao de um kernel novo; 256 MB no critico
+# e o ponto em que a proxima atualizacao falha.
+disk_thresholds() {
+  local size="$1" size_mb mw mc
+  size_mb=$(( size * 1024 ))
+  mw=$(( size_mb / 5 ))    # 20%
+  mc=$(( size_mb / 10 ))   # 10%
+  if [ "$size" -le 10 ]; then
+    # volumes pequenos (/boot, /boot/efi): piso pequeno mas util
+    [ "$mw" -lt 512 ] && mw=512
+    [ "$mc" -lt 256 ] && mc=256
+    echo "80 90 $mw $mc"
+  else
+    # volumes grandes: teto para nao exigir centenas de GB livres
+    mw=$(( size_mb / 10 )); [ "$mw" -gt 20480 ] && mw=20480
+    mc=$(( size_mb / 33 )); [ "$mc" -gt 8192 ]  && mc=8192
+    [ "$mw" -lt 2048 ] && mw=2048
+    [ "$mc" -lt 1024 ] && mc=1024
+    if [ "$size" -le 200 ]; then echo "85 93 $mw $mc"
+    else echo "88 95 $mw $mc"; fi
+  fi
 }
 
 #------------------------------------------------------------------------------
@@ -807,13 +859,13 @@ gen_filesystem_checks() {
     name="$(echo "$mnt" | sed 's|^/$|root|; s|^/||; s|/|_|g')"
     th="$(disk_thresholds "$size_gb")"
     read -r pw pc gw gc <<< "$th"
-    printf '  %s (%sG) -> warn >%s%% ou <%sG | crit >%s%% ou <%sG\n' \
+    printf '  %s (%sG) -> warn >%s%% ou <%sMB | crit >%s%% ou <%sMB\n' \
       "$mnt" "$size_gb" "$pw" "$gw" "$pc" "$gc"
     {
       echo "check filesystem $name with path $mnt"
-      emit_pair "if space free < ${gc} GB for 2 cycles" HIGH 1 "disk-abs-crit" 30
+      emit_pair "if space free < ${gc} MB for 2 cycles" HIGH 1 "disk-abs-crit" 30
       emit_pair "if space usage > ${pc}% for 2 cycles"  HIGH 1 "disk-pct-crit" 30
-      emit_pair "if space free < ${gw} GB for 5 cycles" HIGH 2 "disk-abs-warn" 120
+      emit_pair "if space free < ${gw} MB for 5 cycles" HIGH 2 "disk-abs-warn" 120
       emit_pair "if space usage > ${pw}% for 5 cycles"  HIGH 2 "disk-pct-warn" 120
       echo "  # inodes enchem sozinhos, com o disco 'vazio'"
       emit_pair "if inode usage > 90% for 3 cycles" HIGH 1 "inode" 60
@@ -827,43 +879,104 @@ gen_filesystem_checks() {
   rm -f "$out"
 }
 
+# ICMP nao e o teste que importa: a aplicacao fala TCP, nao ping. Em nuvem
+# (EC2, GCP) e em rede corporativa o ICMP costuma ser bloqueado enquanto o
+# HTTPS passa - gerando alerta permanente de "sem internet" num host saudavel.
+# Por isso o instalador TESTA antes de decidir qual check gerar.
+probe_icmp() { ping -c 2 -W 2 "$1" >/dev/null 2>&1; }
+probe_tcp()  { timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+
 gen_network_checks() {
-  if [ -z "$GATEWAY" ]; then
-    # '|| true' obrigatorio: sob 'set -e -o pipefail' um 'ip' ausente
-    # (container minimo, RHEL sem iproute) abortaria o instalador inteiro
-    # depois de ja ter escrito metade dos arquivos.
+  head1 "8. Conectividade"
+  local ext_mode=""
+
+  if [ "$CONNECTIVITY" = icmp ] || [ "$CONNECTIVITY" = auto ]; then
+    if probe_icmp "$PING_TARGET"; then
+      ext_mode=icmp; ok "ICMP para $PING_TARGET responde"
+    elif [ "$CONNECTIVITY" = icmp ]; then
+      ext_mode=icmp; warn "ICMP nao responde, mas foi pedido explicitamente"
+    fi
+  fi
+  if [ -z "$ext_mode" ] && [ "$CONNECTIVITY" != none ]; then
+    if probe_tcp "$PING_TARGET" 443; then
+      ext_mode=tcp
+      [ "$CONNECTIVITY" = auto ] && warn "ICMP bloqueado - usando TCP 443, que e o caminho real da aplicacao"
+    else
+      warn "nem ICMP nem TCP 443 alcancam $PING_TARGET - sem check externo"
+    fi
+  fi
+
+  # gateway: so vale onde ha rede propria E ele responde. Em nuvem, o roteador
+  # virtual normalmente ignora ICMP e o alerta seria permanente e inutil.
+  if [ -z "$GATEWAY" ] && [ "$CONNECTIVITY" != none ]; then
     if command -v ip >/dev/null 2>&1; then
       GATEWAY="$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}' || true)"
     elif command -v route >/dev/null 2>&1; then
       GATEWAY="$(route -n 2>/dev/null | awk '/^0\.0\.0\.0/{print $2; exit}' || true)"
     fi
-    if [ -n "$GATEWAY" ] && [ "$ASSUME_YES" -eq 0 ]; then
+    if [ -n "$GATEWAY" ] && ! probe_icmp "$GATEWAY"; then
+      warn "gateway $GATEWAY nao responde a ICMP (normal em nuvem) - pulando"
+      GATEWAY=""
+    elif [ -n "$GATEWAY" ] && [ "$ASSUME_YES" -eq 0 ]; then
       GATEWAY="$(ask '  Gateway para check ICMP (vazio = pular)' "$GATEWAY")"
     fi
   fi
-  [ -n "$GATEWAY" ] || { warn "sem check de conectividade"; return; }
-  head1 "8. Conectividade"
+
+  if [ -z "$ext_mode" ] && [ -z "$GATEWAY" ]; then
+    warn "nenhum check de rede gerado"; return
+  fi
+
   {
     echo "# 02-network.conf - gerado em $(date -Iseconds)"
-    echo "# ICMP exige Monit rodando como root. Debounce alto: perda de pacote e normal."
+    echo "# Só entra o que respondeu durante a instalacao."
     echo
-    echo "check host gateway with address $GATEWAY"
-    emit_pair "if failed ping count 3 with timeout 5 seconds for 3 cycles" HIGH 1 icmp 30
-    echo
-    echo "# Conectividade externa: alvo por IP, NAO por nome. Usar google.com"
-    echo "# aqui misturaria duas falhas diferentes (rede caiu x DNS quebrou) no"
-    echo "# mesmo alerta, e o Monit resolveria o nome a cada ciclo."
-    echo "check host internet with address $PING_TARGET"
-    emit_pair "if failed ping count 3 with timeout 5 seconds for 5 cycles" HIGH 2 icmp 60
-    echo
-    echo "# Resolucao de nomes testada separadamente, falando DNS de verdade."
-    echo "check host dns with address $PING_TARGET"
-    emit_pair "if failed port 53 type udp protocol dns for 5 cycles" HIGH 2 dns 60
+    if [ -n "$GATEWAY" ]; then
+      echo "check host gateway with address $GATEWAY"
+      emit_pair "if failed ping count 3 with timeout 5 seconds for 3 cycles" HIGH 1 icmp 30
+      echo
+    fi
+    if [ "$ext_mode" = icmp ]; then
+      echo "# Alvo por IP: nome misturaria falha de DNS com falha de rede."
+      echo "check host internet with address $PING_TARGET"
+      emit_pair "if failed ping count 3 with timeout 5 seconds for 5 cycles" HIGH 2 icmp 60
+      echo
+    elif [ "$ext_mode" = tcp ]; then
+      echo "# TCP 443 em vez de ICMP: independe de ICMP liberado no firewall."
+      echo "check host internet with address $PING_TARGET"
+      emit_pair "if failed port 443 type tcp with timeout 5 seconds for 5 cycles" HIGH 2 tcp443 60
+      echo
+    fi
+    if [ -n "$ext_mode" ]; then
+      echo "# Servidor DNS remoto responde? (nao testa o resolver local)"
+      echo "check host dns with address $PING_TARGET"
+      emit_pair "if failed port 53 type udp protocol dns for 5 cycles" HIGH 2 dns 60
+      echo
+    fi
+    # Resolucao de nomes: por ICMP quando disponivel (mais direto e o que o
+    # operador espera ver), com o teste via getent como complemento. Onde o
+    # ICMP e bloqueado, o getent e a UNICA forma de validar o resolver.
+    if [ "$ext_mode" = icmp ]; then
+      echo "# Resolve E alcanca o nome? Com o check 'internet' acima por IP,"
+      echo "# uma falha SO aqui aponta para resolucao de nomes."
+      echo "# Verificado no Monit 5.33: nome nao resolvivel NAO impede o"
+      echo "# carregamento da configuracao - a resolucao ocorre em runtime."
+      echo "check host resolucao with address $RESOLVE_NAME"
+      emit_pair "if failed ping count 3 with timeout 5 seconds for 5 cycles" HIGH 2 pingname 60
+      echo
+    fi
+    echo "# O RESOLVER DESTE HOST funciona? Testa /etc/resolv.conf,"
+    echo "# systemd-resolved e nsswitch - o caminho que a aplicacao usa."
+    echo "# Resolve em tempo de execucao, entao nao impede o monit de carregar"
+    echo "# a configuracao se o DNS estiver fora no momento do reload."
+    echo "check program dns-resolver with path \"$BIN_DIR/ilert-dns.sh\""
+    echo "  every 5 cycles"
+    emit_pair "if status != 0 for 3 cycles" HIGH 2 resolver 60
   } > /tmp/02-network.conf
   write_file "$CONF_D/02-network.conf" 0600 < /tmp/02-network.conf
   rm -f /tmp/02-network.conf
-  ok "gateway: $GATEWAY"
+  ok "externo: ${ext_mode:-nenhum} | gateway: ${GATEWAY:-nenhum}"
 }
+
 
 # systemd com ProtectSystem=strict/full monta /run e /var somente-leitura para
 # o servico. Duas consequencias silenciosas:
@@ -881,13 +994,19 @@ ensure_monit_sandbox() {
   head1 "9c. Sandbox do systemd"
   warn "monit roda com ProtectSystem=$prot (/run e /var somente-leitura)"
 
-  # diretorios de socket realmente usados neste host.
+  # Os diretorios sao extraidos dos checks JA GERADOS, nao de uma lista fixa:
+  # um pool php-fpm ou um Redis com 'listen' fora do padrao ficaria de fora.
   # O prefixo '-' torna cada caminho OPCIONAL: sem ele, um diretorio que nao
   # exista no momento do start impede o monit de iniciar
   # ("Failed to set up mount namespacing"). Sockets em /run somem no boot.
   local -a rw=("-/var/lib/ilert")
   local d
-  for d in /run/php /run/mysqld /run/postgresql /run/redis /run/docker.sock; do
+  while read -r d; do
+    [ -n "$d" ] && rw+=("-$d")
+  done < <(grep -horE 'unixsocket[[:space:]]+[^[:space:]]+' "$CONF_D"/*.conf 2>/dev/null \
+           | awk '{print $2}' | xargs -r -n1 dirname 2>/dev/null | sort -u || true)
+  # sockets que o Monit acessa sem a palavra 'unixsocket' (docker, protocolos)
+  for d in /run/php /run/mysqld /run/postgresql /run/redis /var/run/docker.sock; do
     [ -e "$d" ] && rw+=("-$(dirname "$d/x")")
   done
   mapfile -t rw < <(printf '%s\n' "${rw[@]}" | sort -u)
@@ -1464,10 +1583,10 @@ main() {
   gen_network_checks
   gen_heartbeat_check
   gen_flush_check
-  ensure_monit_sandbox
   detect_services
   gen_service_checks
   gen_port_checks
+  ensure_monit_sandbox
   validate_and_start
   send_test_event
   summary
