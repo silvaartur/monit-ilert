@@ -56,7 +56,7 @@
 #===============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="2.11.2"
+SCRIPT_VERSION="2.12.0"
 BIN_DIR="/usr/local/bin"
 ENV_FILE="/etc/ilert.env"
 API_URL="https://api.ilert.com/api/events"
@@ -762,6 +762,7 @@ emit_restart_policy() { # emit_restart_policy <nome-do-check>
 # arquivos de terceiros em conf.d). O Monit exige nomes unicos em TODA a
 # configuracao; colidir aborta o 'monit -t' com "Service name conflict".
 EXISTING_NAMES=""
+SANDBOX_DROPIN=0
 collect_existing_names() {
   local managed='00-system|01-filesystem|02-network|03-heartbeat|04-flush|10-services|15-ports'
   # 'find -L': o Debian popula conf-enabled com SYMLINKS para conf-available
@@ -1061,17 +1062,12 @@ ensure_monit_sandbox() {
 ReadWritePaths=${rw[*]}
 EOF
   run systemctl daemon-reload
+  SANDBOX_DROPIN=1
   ok "ReadWritePaths: ${rw[*]}"
-  # Um drop-in ruim so aparece no proximo start; melhor descobrir agora.
-  if [ "$DRY_RUN" -eq 0 ] && systemctl is-active --quiet monit; then
-    if ! systemctl restart monit || ! systemctl is-active --quiet monit; then
-      warn "monit nao subiu com o drop-in - removendo"
-      rm -f /etc/systemd/system/monit.service.d/ilert.conf
-      systemctl daemon-reload || true
-      systemctl start monit || true
-      warn "sockets unix podem falhar; veja 'systemctl status monit'"
-    fi
-  fi
+  # O restart NAO acontece aqui: a configuracao ainda nao passou pelo
+  # 'monit -t'. Se ela estiver quebrada, o monit nao subiria e a culpa cairia
+  # no drop-in, que seria removido sem motivo. Quem reinicia e valida o
+  # resultado e o validate_and_start, depois da configuracao aprovada.
 }
 
 gen_flush_check() {
@@ -1510,13 +1506,36 @@ validate_and_start() {
   ok "sintaxe validada"
 
   run systemctl enable monit >/dev/null 2>&1 || true
-  if systemctl is-active --quiet monit; then
+
+  # 'reload' nao aplica mudanca de unit do systemd: ReadWritePaths so passa a
+  # valer com um restart de verdade. Por isso o restart e obrigatorio quando
+  # criamos o drop-in nesta execucao.
+  if [ "$SANDBOX_DROPIN" -eq 1 ]; then
+    run systemctl restart monit
+  elif systemctl is-active --quiet monit; then
     run systemctl reload monit || run systemctl restart monit
   else
     run systemctl start monit
   fi
   sleep 3
-  systemctl is-active --quiet monit || die "monit nao subiu: journalctl -u monit -n 50"
+
+  if ! systemctl is-active --quiet monit; then
+    if [ "$SANDBOX_DROPIN" -eq 1 ]; then
+      warn "monit nao subiu - suspeitando do drop-in do systemd, removendo"
+      rm -f /etc/systemd/system/monit.service.d/ilert.conf
+      systemctl daemon-reload || true
+      systemctl start monit || true
+      sleep 3
+      if systemctl is-active --quiet monit; then
+        warn "monit voltou SEM o drop-in - sockets unix podem falhar"
+        warn "veja 'systemctl status monit' e ajuste ReadWritePaths a mao"
+        ok "monit ativo"
+        return
+      fi
+    fi
+    rollback
+    die "monit nao subiu e a configuracao foi revertida: journalctl -u monit -n 50"
+  fi
   ok "monit ativo"
 }
 
