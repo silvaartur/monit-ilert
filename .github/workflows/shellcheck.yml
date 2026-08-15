@@ -40,6 +40,21 @@ jobs:
           sudo bash install-monit-ilert.sh --dry-run --yes --key CHAVE-FALSA \
             --no-heartbeat --auto-restart all --ports "app:8080:http"
 
+      # Valida a configuracao gerada contra o Monit de verdade, nao so a
+      # sintaxe do bash. Pega conflito de nome de check, sintaxe de teste
+      # invalida e afins - coisas que o shellcheck nunca veria.
+      - name: Validar config gerada com o Monit real
+        run: |
+          sudo apt-get install -y -qq monit
+          monit -V | head -1
+          for f in ilert.sh ilert-beat.sh ilert-flush.sh ilert-giveup.sh ilert-dns.sh; do
+            sudo install -m 700 /dev/stdin "/usr/local/bin/$f" <<< '#!/bin/bash
+          exit 0'
+          done
+          sudo bash install-monit-ilert.sh --yes --key CHAVE-FALSA --no-heartbeat \
+            --connectivity none --auto-restart all || true
+          sudo monit -t
+
       - name: Varredura de segredos
         run: |
           if grep -rnE 'il1(api|hbt|hb2)[0-9a-f]{16}|ih2:[0-9]+:[a-z]+:' \
