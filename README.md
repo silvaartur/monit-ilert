@@ -22,6 +22,7 @@ Não existe integração nativa Monit ↔ ilert no catálogo deles. Este script 
 O script é interativo, então baixe e execute — não use `curl | sudo bash` às cegas, você deve ler o que vai rodar como root na sua máquina:
 
 ```bash
+cd ~                                 # precisa de um diretorio com permissao de escrita
 curl -fsSL https://raw.githubusercontent.com/silvaartur/monit-ilert/main/install-monit-ilert.sh -o install-monit-ilert.sh
 less install-monit-ilert.sh          # leia antes de executar
 chmod +x install-monit-ilert.sh
@@ -94,6 +95,7 @@ Também aceita `ILERT_KEY`, `ILERT_HEARTBEAT_URL`, `ILERT_HOST` e `ILERT_ENV` co
 O script é idempotente e **preserva o `/etc/ilert.env`**, inclusive ajustes manuais como a URL do heartbeat. Arquivos cujo conteúdo não mudou não são reescritos.
 
 ```bash
+cd ~
 curl -fsSL https://raw.githubusercontent.com/silvaartur/monit-ilert/main/install-monit-ilert.sh -o install-monit-ilert.sh
 chmod +x install-monit-ilert.sh
 sudo ./install-monit-ilert.sh --host $(hostname)
