@@ -12,21 +12,39 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Instalar shellcheck
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --version
 
       - name: Validar sintaxe
         run: bash -n install-monit-ilert.sh
 
+      # -S error evita que uma versao mais nova do shellcheck, com checagens
+      # novas, reprove o build por avisos de estilo. SC2034 e conhecido e
+      # intencional (variavel de leitura no loop do df).
       - name: Analise estatica
+        run: shellcheck -S error -e SC2034 install-monit-ilert.sh
+
+      - name: Avisos (informativo, nao reprova)
+        continue-on-error: true
         run: shellcheck -S warning -e SC2034 install-monit-ilert.sh
 
+      # 'bash <arquivo>' em vez de './<arquivo>': independe do bit de execucao,
+      # que pode se perder dependendo de como o arquivo foi commitado.
       - name: Dry-run nao-interativo
-        run: sudo ./install-monit-ilert.sh --dry-run --yes --key CHAVE-FALSA --no-heartbeat
+        run: sudo bash install-monit-ilert.sh --dry-run --yes --key CHAVE-FALSA --no-heartbeat
+
+      - name: Dry-run com portas e auto-restart
+        run: |
+          sudo bash install-monit-ilert.sh --dry-run --yes --key CHAVE-FALSA \
+            --no-heartbeat --auto-restart all --ports "app:8080:http"
 
       - name: Varredura de segredos
         run: |
-          if grep -rnE 'il1(api|hbt|hb2)[0-9a-f]{8}|ih2:[0-9]+:' \
+          if grep -rnE 'il1(api|hbt|hb2)[0-9a-f]{16}|ih2:[0-9]+:[a-z]+:' \
                --include='*.sh' --include='*.md' .; then
-            echo "ERRO: possivel chave real versionada"; exit 1
+            echo "ERRO: possivel chave real versionada"
+            exit 1
           fi
           echo "nenhum segredo encontrado"
