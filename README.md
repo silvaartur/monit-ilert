@@ -82,6 +82,8 @@ Prefira `--key-file` a `--key`: argumentos de linha de comando aparecem em `ps` 
 | `--swap-warn N` | Limiar de warning de swap em % (default 10) |
 | `--swap-crit N` | Limiar de critical de swap em % (default 30) |
 | `--ping-target IP` | Alvo externo de ICMP e DNS (default `1.1.1.1`) |
+| `--connectivity MODO` | `auto` (default), `icmp`, `tcp` ou `none` |
+| `--resolve-name NOME` | Nome usado no teste de resolução (default `google.com`) |
 | `--swap-warn N` | % de swap para warning (default 10) |
 | `--swap-crit N` | % de swap para critical (default 30) |
 | `--no-heartbeat` | Não configura heartbeat |
@@ -145,7 +147,15 @@ Bancos e Docker ficam fora do modo `safe` de propósito: reiniciar um banco no m
 
 Além dos serviços, sempre são criados checks de sistema (load, CPU system/iowait, memória, swap), de cada filesystem real, ICMP para o gateway, ICMP e DNS para um alvo externo, e o heartbeat.
 
-O alvo externo é sempre um **IP**, nunca um nome como `google.com`: pingar um nome junta duas falhas distintas — rede fora do ar e DNS quebrado — no mesmo alerta, e faz o Monit resolver o nome a cada ciclo. A resolução de nomes tem check próprio, falando DNS de verdade na porta 53.
+O instalador **testa a rede antes de gerar o check**. Se o ICMP não responder — comum em EC2, GCP e redes corporativas, onde o firewall bloqueia ping mas libera HTTPS — ele gera um teste de TCP 443 no lugar. Isso mede o caminho que a aplicação realmente usa e evita um alerta permanente de "sem internet" num host saudável. O check de gateway só entra se o gateway responder; em nuvem, o roteador virtual costuma ignorar ICMP e o teste não teria valor diagnóstico.
+
+O alvo externo é sempre um **IP**, nunca um nome como `google.com`: pingar um nome junta duas falhas distintas — rede fora do ar e DNS quebrado — no mesmo alerta.
+
+A resolução de nomes tem dois checks separados, que respondem a perguntas diferentes:
+
+- **`dns`** consulta o servidor externo na porta 53 — prova que o resolver remoto está de pé.
+- **`resolucao`** pinga o nome configurado (`google.com` por padrão). Como o check `internet` usa IP, uma falha só aqui isola a resolução de nomes.
+- **`dns-resolver`** roda `getent hosts` e valida o resolver **deste host**: `/etc/resolv.conf`, `systemd-resolved`, `nsswitch`. É o caminho que a aplicação usa de verdade, e o único que detecta um resolver local quebrado.
 
 ## Portas TCP
 
@@ -223,7 +233,7 @@ Os defaults saem do hardware, não de números redondos:
 
 - **Load**: warning em 1×`nproc`, critical em 2×`nproc`, sempre na média de 5min (a de 1min dispara em qualquer `apt upgrade`)
 - **Memória**: escalonada pela RAM total — hosts pequenos recebem limiar mais apertado
-- **Disco**: percentual **e** GB livres simultaneamente, ambos derivados do tamanho do volume. 10% de 4 TB são 400 GB (tranquilo); 10% de 20 GB são 2 GB (crítico)
+- **Disco**: percentual **e** espaço livre em MB simultaneamente, ambos derivados do tamanho do volume. 10% de 4 TB são 400 GB (tranquilo); 10% de 20 GB são 2 GB (crítico). Volumes pequenos como `/boot` usam piso de 512 MB no warning — o suficiente para instalar um kernel — em vez de um valor fixo em GB que alertaria desde o primeiro dia
 - **Swap**: warning em 10%, critical em 30%, com debounce longo de propósito. Swap pontual durante backup é normal; o que importa é swap que **não volta**. Ajuste com `--swap-warn` / `--swap-crit`
 
 Depois de 1–2 semanas rodando, ajuste com dados reais: instale `sysstat` e use **p95 + 20%** como warning.
