@@ -1,0 +1,6 @@
+# Nunca versione segredos nem estado local
+*.env
+*.key
+ilert.env
+*.bak-*
+/var/lib/ilert/
