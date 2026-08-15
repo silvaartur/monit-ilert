@@ -1,0 +1,32 @@
+name: shellcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Validar sintaxe
+        run: bash -n install-monit-ilert.sh
+
+      - name: Analise estatica
+        run: shellcheck -S warning -e SC2034 install-monit-ilert.sh
+
+      - name: Dry-run nao-interativo
+        run: sudo ./install-monit-ilert.sh --dry-run --yes --key CHAVE-FALSA --no-heartbeat
+
+      - name: Varredura de segredos
+        run: |
+          if grep -rnE 'il1(api|hbt|hb2)[0-9a-f]{8}|ih2:[0-9]+:' \
+               --include='*.sh' --include='*.md' .; then
+            echo "ERRO: possivel chave real versionada"; exit 1
+          fi
+          echo "nenhum segredo encontrado"
