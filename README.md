@@ -1,5 +1,7 @@
 # monit-ilert
 
+[![shellcheck](https://github.com/silvaartur/monit-ilert/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/silvaartur/monit-ilert/actions/workflows/shellcheck.yml)
+
 Instalador que configura o [Monit](https://mmonit.com/monit/) integrado ao [ilert](https://www.ilert.com/) em um servidor Linux, com alertas que **abrem e fecham sozinhos**, limiares calculados a partir do hardware real da máquina e proteção contra tempestade de alertas em crash loop.
 
 Não existe integração nativa Monit ↔ ilert no catálogo deles. Este script preenche essa lacuna usando a Events API.
@@ -74,7 +76,13 @@ Prefira `--key-file` a `--key`: argumentos de linha de comando aparecem em `ps` 
 | `--env AMBIENTE` | Vai no label `env` (default: `prod`) |
 | `--services LISTA` | Serviços a monitorar, separados por vírgula |
 | `--ports LISTA` | Serviços TCP (veja formato abaixo) |
-| `--gateway IP` | Host do check ICMP |
+| `--gateway IP` | Host do check ICMP interno |
+| `--auto-restart MODO` | `safe` (default), `all` ou `none` — veja abaixo |
+| `--swap-warn N` | Limiar de warning de swap em % (default 10) |
+| `--swap-crit N` | Limiar de critical de swap em % (default 30) |
+| `--ping-target IP` | Alvo externo de ICMP e DNS (default `1.1.1.1`) |
+| `--swap-warn N` | % de swap para warning (default 10) |
+| `--swap-crit N` | % de swap para critical (default 30) |
 | `--no-heartbeat` | Não configura heartbeat |
 | `--dry-run` | Mostra o que faria, sem escrever nada |
 | `--uninstall` | Remove o que o instalador criou |
@@ -86,7 +94,7 @@ Também aceita `ILERT_KEY`, `ILERT_HEARTBEAT_URL`, `ILERT_HOST` e `ILERT_ENV` co
 O script é idempotente e **preserva o `/etc/ilert.env`**, inclusive ajustes manuais como a URL do heartbeat. Arquivos cujo conteúdo não mudou não são reescritos.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SEU-USUARIO/monit-ilert/main/install-monit-ilert.sh -o install-monit-ilert.sh
+curl -fsSL https://raw.githubusercontent.com/silvaartur/monit-ilert/main/install-monit-ilert.sh -o install-monit-ilert.sh
 chmod +x install-monit-ilert.sh
 sudo ./install-monit-ilert.sh --host $(hostname)
 ```
@@ -115,9 +123,27 @@ sudo monit status
 
 A versão do PHP-FPM é detectada sozinha, então 7.x, 8.x e futuras funcionam sem alteração.
 
-Bancos, Redis e Docker ficam sem restart automático de propósito: reiniciar um banco no meio de uma corrupção piora o quadro, reiniciar `dockerd` derruba toda a stack, e reiniciar Redis com persistência pode descartar escritas ainda não gravadas. O script alerta; a decisão é humana.
+### Auto-restart
 
-Além dos serviços, sempre são criados checks de sistema (load, CPU system/iowait, memória, swap), de cada filesystem real, ICMP para gateway e DNS externo, e o heartbeat.
+Por padrão (`--auto-restart safe`), nginx, apache2, php-fpm e Redis se reerguem sozinhos: o Monit alerta em 2 ciclos e tenta `restart` em 3. **Se o serviço não estabilizar após 3 restarts em 20 ciclos, o Monit desiste**, suspende o check e escala SEV1 pelo `ilert-giveup.sh` — reiniciar em loop mascara a causa, queima I/O e pode corromper estado.
+
+Para voltar a monitorar depois de resolver:
+
+```bash
+sudo monit monitor <serviço>
+```
+
+O alerta `restartloop` **não fecha sozinho** — o check estava suspenso, então não houve recuperação para o Monit detectar. Resolva no painel do ilert ao religar, ou deixe o `auto_resolution_timeout` do alert source cuidar disso.
+
+Se a unit do serviço já tem `Restart=on-failure` no systemd, você terá duas camadas tentando reerguer a mesma coisa. Verifique com `systemctl show <serviço> -p Restart` e, se já houver política lá, prefira `--auto-restart none` para esse serviço.
+
+`--auto-restart all` inclui bancos e Docker; `none` desliga e só alerta.
+
+Bancos e Docker ficam fora do modo `safe` de propósito: reiniciar um banco no meio de uma corrupção piora o quadro, reiniciar `dockerd` derruba toda a stack, e reiniciar Redis com persistência pode descartar escritas ainda não gravadas. O script alerta; a decisão é humana.
+
+Além dos serviços, sempre são criados checks de sistema (load, CPU system/iowait, memória, swap), de cada filesystem real, ICMP para o gateway, ICMP e DNS para um alvo externo, e o heartbeat.
+
+O alvo externo é sempre um **IP**, nunca um nome como `google.com`: pingar um nome junta duas falhas distintas — rede fora do ar e DNS quebrado — no mesmo alerta, e faz o Monit resolver o nome a cada ciclo. A resolução de nomes tem check próprio, falando DNS de verdade na porta 53.
 
 ## Portas TCP
 
@@ -196,7 +222,7 @@ Os defaults saem do hardware, não de números redondos:
 - **Load**: warning em 1×`nproc`, critical em 2×`nproc`, sempre na média de 5min (a de 1min dispara em qualquer `apt upgrade`)
 - **Memória**: escalonada pela RAM total — hosts pequenos recebem limiar mais apertado
 - **Disco**: percentual **e** GB livres simultaneamente, ambos derivados do tamanho do volume. 10% de 4 TB são 400 GB (tranquilo); 10% de 20 GB são 2 GB (crítico)
-- **Swap**: debounce longo de propósito. Swap pontual em backup é normal; o que importa é swap que não volta
+- **Swap**: warning em 10%, critical em 30%, com debounce longo de propósito. Swap pontual durante backup é normal; o que importa é swap que **não volta**. Ajuste com `--swap-warn` / `--swap-crit`
 
 Depois de 1–2 semanas rodando, ajuste com dados reais: instale `sysstat` e use **p95 + 20%** como warning.
 
@@ -235,6 +261,8 @@ curl -i "<a URL completa do monitor>"
 ```
 
 Se a doc do ilert mostrar `${YOUR-APIKEY}` e você colar isso literalmente no bash, o shell interpreta como "valor de `$YOUR`, ou `APIKEY` se não existir" e pinga o endpoint errado. Use a chave crua.
+
+**`Connection failed` num socket unix com o serviço saudável.** Se a unit do Monit tem `ProtectSystem=strict` ou `full`, `/run` e `/var` ficam somente-leitura para ele — e `connect()` num socket unix exige escrita no arquivo do socket. O mesmo sandbox impede o `ilert.sh` de gravar os marcadores de resolve adiado, desligando o anti-flapping em silêncio. Verifique com `systemctl show monit -p ProtectSystem`; o instalador detecta e cria um drop-in com `ReadWritePaths` para os diretórios de socket usados no host.
 
 **Alerta chega como `status failed (1) -- no output`.** O Monit captura o stdout do programa e coloca na descrição. Se um script seu não imprime nada ao falhar, o alerta fica sem informação — imprima o erro no stdout.
 
