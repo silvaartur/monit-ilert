@@ -53,7 +53,7 @@
 #===============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="2.5.3"
+SCRIPT_VERSION="2.6.0"
 BIN_DIR="/usr/local/bin"
 ENV_FILE="/etc/ilert.env"
 API_URL="https://api.ilert.com/api/events"
@@ -750,11 +750,23 @@ canonical_unit() {
 #------------------------------------------------------------------------------
 gen_system_checks() {
   head1 "6. Checks de sistema"
+  # O Monit aceita um unico 'check system'. Se ja existe um nos arquivos que
+  # preservamos (conf-enabled, 20-custom.conf), usar '$HOST' de novo aborta o
+  # 'monit -t' com "Service name conflict".
+  local sysname='$HOST' existing=""
+  existing="$(grep -rlE '^[[:space:]]*check[[:space:]]+system' \
+              "$CONF_D" "$MONIT_DIR/conf-enabled" 2>/dev/null \
+              | grep -v '00-system.conf' | head -1 || true)"
+  if [ -n "$existing" ]; then
+    sysname="\$HOST-recursos"
+    warn "ja existe 'check system' em $existing"
+    warn "usando o nome '$sysname' para evitar conflito"
+  fi
   {
     echo "# 00-system.conf - gerado em $(date -Iseconds)"
     echo "# cores=$CORES RAM=${RAM_MB}MB"
     echo
-    echo "check system \$HOST"
+    echo "check system $sysname"
     echo
     echo "  # ---- LOAD (5min; a de 1min dispara em qualquer apt upgrade) ----"
     emit_pair "if loadavg (5min) > $LOAD_CRIT for 3 cycles" HIGH 1 load-crit 30
@@ -968,6 +980,12 @@ detect_services() {
   fi
   # dedupe (guarda contra array vazio sob set -u em bash < 4.4)
   mapfile -t DETECTED < <(printf '%s\n' ${DETECTED[@]+"${DETECTED[@]}"} | awk 'NF' | sort -u)
+  # No Debian, postgresql.service e um wrapper que apenas aciona a instancia
+  # postgresql@NN-main.service. Monitorar os dois gera dois checks para o mesmo
+  # processo - e o Monit recusa por conflito de nome. A instancia vence.
+  if printf '%s\n' "${DETECTED[@]}" | grep -q '@'; then
+    mapfile -t DETECTED < <(printf '%s\n' "${DETECTED[@]}" | grep -v '^postgresql$' || true)
+  fi
 
   echo "  Detectados: ${DETECTED[*]}"
   echo
@@ -1066,13 +1084,15 @@ gen_service_checks() {
         } >> "$out"
         ;;
       postgresql|postgresql@*)
+        local pgname
+        pgname="$(printf '%s' "$s" | tr -c 'a-zA-Z0-9_' '_')"
         pid="$(find_pidfile postgresql.service /var/run/postgresql/*.pid \
                /var/lib/pgsql/data/postmaster.pid /var/lib/postgresql/*/main/postmaster.pid)" || pid=""
         {
-          if [ -n "$pid" ]; then echo "check process postgresql with pidfile $pid"
-          else echo "check process postgresql matching \"postgres.*checkpointer\""; fi
-          echo "  start program = \"/bin/systemctl start postgresql\" with timeout 90 seconds"
-          echo "  stop  program = \"/bin/systemctl stop postgresql\" with timeout 90 seconds"
+          if [ -n "$pid" ]; then echo "check process $pgname with pidfile $pid"
+          else echo "check process $pgname matching \"postgres.*checkpointer\""; fi
+          echo "  start program = \"/bin/systemctl start $s\" with timeout 90 seconds"
+          echo "  stop  program = \"/bin/systemctl stop $s\" with timeout 90 seconds"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
           restart_ok "$s" && emit_restart_policy "$s"
           emit_pair "if failed host 127.0.0.1 port 5432 protocol pgsql for 3 cycles" HIGH 1 port 30
