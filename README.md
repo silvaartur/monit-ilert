@@ -194,6 +194,12 @@ Protocolos suportados pelo Monit: `http`, `https`, `mysql`, `pgsql`, `redis`, `m
 
 Caminhos variam em RHEL (`/etc/monitrc`, `/etc/monit.d/`).
 
+## Convivência com checks existentes
+
+O instalador preserva o que já existe (`conf-enabled`, arquivos de terceiros em `conf.d`) e detecta os nomes de check já usados. Como o Monit exige nomes únicos em toda a configuração, uma colisão abortaria a validação — nesses casos ele sufixa o **seu** check com `-ilert` e avisa. Você fica com os dois e decide qual remover.
+
+Se o check antigo não alerta para lugar nenhum, remova-o: dois checks no mesmo processo desperdiçam ciclo e confundem o diagnóstico.
+
 ## Customização
 
 O instalador só gerencia os arquivos com os nomes acima. **Qualquer arquivo com outro nome sobrevive a reexecuções** — use `20-custom.conf` para o que for seu:
