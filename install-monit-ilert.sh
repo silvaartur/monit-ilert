@@ -56,7 +56,7 @@
 #===============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="2.10.0"
+SCRIPT_VERSION="2.11.2"
 BIN_DIR="/usr/local/bin"
 ENV_FILE="/etc/ilert.env"
 API_URL="https://api.ilert.com/api/events"
@@ -758,6 +758,46 @@ emit_restart_policy() { # emit_restart_policy <nome-do-check>
   echo "    then exec \"$BIN_DIR/ilert-giveup.sh $svc\""
 }
 
+# Nomes de check ja usados na configuracao que preservamos (conf-enabled e
+# arquivos de terceiros em conf.d). O Monit exige nomes unicos em TODA a
+# configuracao; colidir aborta o 'monit -t' com "Service name conflict".
+EXISTING_NAMES=""
+collect_existing_names() {
+  local managed='00-system|01-filesystem|02-network|03-heartbeat|04-flush|10-services|15-ports'
+  # 'find -L': o Debian popula conf-enabled com SYMLINKS para conf-available
+  # (mesmo esquema do Apache). Sem o -L, '-type f' encontra zero arquivos e a
+  # deteccao de conflito falha justamente onde ela e mais necessaria.
+  # O monitrc tambem entra: se o operador recusou sobrescreve-lo, os checks
+  # dele continuam valendo.
+  EXISTING_NAMES=" $(
+    { find -L "$CONF_D" -maxdepth 1 -name '*.conf' -type f 2>/dev/null \
+        | grep -vE "/($managed)\.conf$"
+      find -L "$MONIT_DIR/conf-enabled" -maxdepth 1 -type f 2>/dev/null
+      [ -f "$MONITRC" ] && printf '%s\n' "$MONITRC"
+    } | xargs -r grep -hoE '^[[:space:]]*check[[:space:]]+(process|system|filesystem|host|program|file|directory|fifo|network)[[:space:]]+[^[:space:]]+' 2>/dev/null \
+      | awk '{print $3}' | sort -u | tr '\n' ' ' || true
+  ) "
+  [ "$EXISTING_NAMES" = "  " ] && EXISTING_NAMES=""
+  [ -n "$EXISTING_NAMES" ] && warn "checks ja definidos fora do instalador:${EXISTING_NAMES}"
+  return 0
+}
+
+# Devolve um nome livre. Se ja existir, sufixa com -ilert em vez de falhar la
+# na validacao - o operador fica com os dois checks e decide o que remover.
+# NOTA: roda em subshell ($(uniq_name ...)), entao nao da para acumular estado
+# aqui. O registro do nome escolhido fica por conta de register_name, chamado
+# pelo gerador - assim dois arquivos nossos tambem nao colidem entre si
+# (um filesystem 'cache' e uma porta 'cache', por exemplo).
+uniq_name() {
+  local n="$1"
+  case "$EXISTING_NAMES" in
+    *" $n "*) warn "nome '$n' ja existe - usando '${n}-ilert'"; printf '%s-ilert' "$n" ;;
+    *) printf '%s' "$n" ;;
+  esac
+}
+
+register_name() { EXISTING_NAMES="${EXISTING_NAMES:- }$1 "; }
+
 # emite par ALERT/RESOLVE
 emit_pair() { # emit_pair <condicao> <prio> <sev> <sufixo> [repeat_cycles]
   local cond="$1" prio="$2" sev="$3" sfx="$4" rep="${5:-}"
@@ -856,7 +896,8 @@ gen_filesystem_checks() {
       /snap/*|/var/lib/docker/*|/proc*|/sys*|/run*|/dev*) continue ;;
     esac
     [ "$size_gb" -ge 1 ] 2>/dev/null || continue
-    name="$(echo "$mnt" | sed 's|^/$|root|; s|^/||; s|/|_|g')"
+    name="$(uniq_name "$(echo "$mnt" | sed 's|^/$|root|; s|^/||; s|/|_|g')")"
+    register_name "$name"
     th="$(disk_thresholds "$size_gb")"
     read -r pw pc gw gc <<< "$th"
     printf '  %s (%sG) -> warn >%s%% ou <%sMB | crit >%s%% ou <%sMB\n' \
@@ -1154,8 +1195,9 @@ gen_service_checks() {
     esac
   }
 
-  local s pid
+  local s pid cn
   for s in "${CHOSEN[@]}"; do
+    cn="$(uniq_name "$s")"; register_name "$cn"
     case "$s" in
       nginx)
         pid="$(find_pidfile nginx.service /run/nginx.pid /var/run/nginx.pid)" || pid=""
@@ -1165,7 +1207,7 @@ gen_service_checks() {
           echo "  start program = \"/bin/systemctl start nginx\" with timeout 60 seconds"
           echo "  stop  program = \"/bin/systemctl stop nginx\" with timeout 30 seconds"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
-          restart_ok "$s" && emit_restart_policy "$s"
+          restart_ok "$s" && emit_restart_policy "$cn"
           emit_pair "if failed port 80 protocol http request \"/\" for 3 cycles" HIGH 2 http 30
           emit_pair "if cpu > 80% for 10 cycles" HIGH 2 cpu 120
           echo
@@ -1175,12 +1217,12 @@ gen_service_checks() {
         pid="$(find_pidfile "${s}.service" /run/apache2/apache2.pid /run/httpd/httpd.pid \
                /var/run/apache2/apache2.pid)" || pid=""
         {
-          if [ -n "$pid" ]; then echo "check process $s with pidfile $pid"
-          else echo "check process $s matching \"$s\""; fi
+          if [ -n "$pid" ]; then echo "check process $cn with pidfile $pid"
+          else echo "check process $cn matching \"$s\""; fi
           echo "  start program = \"/bin/systemctl start $s\" with timeout 60 seconds"
           echo "  stop  program = \"/bin/systemctl stop $s\" with timeout 30 seconds"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
-          restart_ok "$s" && emit_restart_policy "$s"
+          restart_ok "$s" && emit_restart_policy "$cn"
           emit_pair "if failed port 80 protocol http request \"/\" for 3 cycles" HIGH 2 http 30
           emit_pair "if children > 250 for 5 cycles" HIGH 2 children 120
           echo
@@ -1190,13 +1232,13 @@ gen_service_checks() {
         pid="$(find_pidfile "${s}.service" /run/mysqld/mysqld.pid /var/run/mysqld/mysqld.pid \
                /var/lib/mysql/*.pid)" || pid=""
         {
-          if [ -n "$pid" ]; then echo "check process $s with pidfile $pid"
-          else echo "check process $s matching \"mysqld\""; fi
+          if [ -n "$pid" ]; then echo "check process $cn with pidfile $pid"
+          else echo "check process $cn matching \"mysqld\""; fi
           echo "  start program = \"/bin/systemctl start $s\" with timeout 90 seconds"
           echo "  stop  program = \"/bin/systemctl stop $s\" with timeout 90 seconds"
           echo "  # banco: nunca reinicie sozinho. Alerta e humano decide."
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
-          restart_ok "$s" && emit_restart_policy "$s"
+          restart_ok "$s" && emit_restart_policy "$cn"
           emit_pair "if failed host 127.0.0.1 port 3306 protocol mysql for 3 cycles" HIGH 1 port 30
           emit_pair "if memory > 70% for 10 cycles" HIGH 2 mem 120
           echo
@@ -1204,7 +1246,8 @@ gen_service_checks() {
         ;;
       postgresql|postgresql@*)
         local pgname
-        pgname="$(printf '%s' "$s" | tr -c 'a-zA-Z0-9_' '_')"
+        pgname="$(uniq_name "$(printf '%s' "$s" | tr -c 'a-zA-Z0-9_' '_')")"
+        register_name "$pgname"
         pid="$(find_pidfile postgresql.service /var/run/postgresql/*.pid \
                /var/lib/pgsql/data/postmaster.pid /var/lib/postgresql/*/main/postmaster.pid)" || pid=""
         {
@@ -1213,7 +1256,8 @@ gen_service_checks() {
           echo "  start program = \"/bin/systemctl start $s\" with timeout 90 seconds"
           echo "  stop  program = \"/bin/systemctl stop $s\" with timeout 90 seconds"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
-          restart_ok "$s" && emit_restart_policy "$s"
+          # $pgname, nao $cn: o unmonitor precisa mirar o nome real do check
+          restart_ok "$s" && emit_restart_policy "$pgname"
           emit_pair "if failed host 127.0.0.1 port 5432 protocol pgsql for 3 cycles" HIGH 1 port 30
           emit_pair "if memory > 70% for 10 cycles" HIGH 2 mem 120
           echo
@@ -1228,7 +1272,7 @@ gen_service_checks() {
           echo "  stop  program = \"/bin/systemctl stop docker\" with timeout 60 seconds"
           echo "  # sem restart automatico: derrubaria todos os containers"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
-          restart_ok "$s" && emit_restart_policy "$s"
+          restart_ok "$s" && emit_restart_policy "$cn"
           emit_pair "if failed unixsocket /var/run/docker.sock for 3 cycles" HIGH 1 socket 30
           echo
         } >> "$out"
@@ -1264,12 +1308,12 @@ gen_service_checks() {
           done
         fi
         {
-          if [ -n "$pid" ]; then echo "check process $s with pidfile $pid"
-          else echo "check process $s matching \"php-fpm.*master.*${ver}\""; fi
+          if [ -n "$pid" ]; then echo "check process $cn with pidfile $pid"
+          else echo "check process $cn matching \"php-fpm.*master.*${ver}\""; fi
           echo "  start program = \"/bin/systemctl start $s\" with timeout 60 seconds"
           echo "  stop  program = \"/bin/systemctl stop $s\" with timeout 30 seconds"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
-          restart_ok "$s" && emit_restart_policy "$s"
+          restart_ok "$s" && emit_restart_policy "$cn"
           local sname n=0
           for c in ${psocks[@]+"${psocks[@]}"}; do
             n=$((n + 1))
@@ -1303,14 +1347,14 @@ gen_service_checks() {
           [ -S "$c" ] && { rsock="$c"; break; }
         done
         {
-          if [ -n "$pid" ]; then echo "check process $s with pidfile $pid"
-          else echo "check process $s matching \"redis-server|valkey-server\""; fi
+          if [ -n "$pid" ]; then echo "check process $cn with pidfile $pid"
+          else echo "check process $cn matching \"redis-server|valkey-server\""; fi
           echo "  start program = \"/bin/systemctl start $s\" with timeout 60 seconds"
           echo "  stop  program = \"/bin/systemctl stop $s\" with timeout 60 seconds"
           echo "  # sem restart automatico: se usado como cache com persistencia,"
           echo "  # reiniciar as cegas pode perder dados nao salvos no RDB/AOF"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
-          restart_ok "$s" && emit_restart_policy "$s"
+          restart_ok "$s" && emit_restart_policy "$cn"
           emit_pair "if failed host 127.0.0.1 port 6379 type tcp protocol redis for 3 cycles" \
             HIGH 1 port 30
           if [ -n "$rsock" ]; then
@@ -1437,7 +1481,7 @@ gen_port_checks() {
       name="$(printf '%s' "$name" | tr -c 'a-zA-Z0-9_' '_')"
       [[ "$port" =~ ^[0-9]+$ ]] || { warn "porta invalida em: $e"; continue; }
       # nome do check = nome amigavel; so desambigua se repetir
-      cname="$name"
+      cname="$(uniq_name "$name")"; register_name "$cname"
       case " ${used[*]-} " in *" $cname "*) cname="${name}_${port}" ;; esac
       used+=("$cname")
       printf '  %-24s %s:%s%s\n' "$cname" "$host" "$port" "${proto:+ ($proto)}" >&2
@@ -1578,6 +1622,7 @@ main() {
   install_scripts
   compute_thresholds
   write_monitrc
+  collect_existing_names
   gen_system_checks
   gen_filesystem_checks
   gen_network_checks
