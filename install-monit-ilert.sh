@@ -56,7 +56,7 @@
 #===============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="2.12.0"
+SCRIPT_VERSION="2.12.1"
 BIN_DIR="/usr/local/bin"
 ENV_FILE="/etc/ilert.env"
 API_URL="https://api.ilert.com/api/events"
@@ -1156,8 +1156,9 @@ detect_services() {
 declare -a WRITTEN=()
 
 rollback() {
-  local f
+  local f reload=0
   for f in ${WRITTEN[@]+"${WRITTEN[@]}"}; do
+    case "$f" in */systemd/*) reload=1 ;; esac
     if [ -f "${f}.bak-${STAMP}" ]; then
       mv -f "${f}.bak-${STAMP}" "$f"
       warn "restaurado $f"
@@ -1166,6 +1167,27 @@ rollback() {
       warn "removido $f (nao existia antes)"
     fi
   done
+  # Apagar o drop-in nao basta: o systemd mantem a unit em memoria ate o
+  # daemon-reload. Sem isto, um 'systemctl restart monit' feito depois ainda
+  # aplicaria o ReadWritePaths que acabamos de remover.
+  if [ "$reload" -eq 1 ]; then
+    systemctl daemon-reload 2>/dev/null || true
+    warn "systemd recarregado apos remover o drop-in"
+  fi
+}
+
+# Espera o servico ficar ativo E respondendo. 'is-active' sozinho mente: o
+# systemd marca ativo antes de o Monit abrir a interface HTTP local, e um
+# 'monit status' logo em seguida devolveria "Connection refused".
+wait_monit_ready() {
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if systemctl is-active --quiet monit && monit summary >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  systemctl is-active --quiet monit
 }
 
 gen_service_checks() {
@@ -1517,16 +1539,13 @@ validate_and_start() {
   else
     run systemctl start monit
   fi
-  sleep 3
-
-  if ! systemctl is-active --quiet monit; then
+  if ! wait_monit_ready; then
     if [ "$SANDBOX_DROPIN" -eq 1 ]; then
       warn "monit nao subiu - suspeitando do drop-in do systemd, removendo"
       rm -f /etc/systemd/system/monit.service.d/ilert.conf
       systemctl daemon-reload || true
       systemctl start monit || true
-      sleep 3
-      if systemctl is-active --quiet monit; then
+      if wait_monit_ready; then
         warn "monit voltou SEM o drop-in - sockets unix podem falhar"
         warn "veja 'systemctl status monit' e ajuste ReadWritePaths a mao"
         ok "monit ativo"
