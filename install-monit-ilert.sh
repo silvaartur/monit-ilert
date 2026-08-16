@@ -25,6 +25,9 @@
 #
 # OUTRAS FLAGS:
 #   --key-file ARQ      le a integration key de um arquivo (nao vaza em ps)
+#   --heartbeat-key V   key OU URL completa do heartbeat monitor
+#   --env AMBIENTE      valor do label 'env' (default prod)
+#   --services LISTA    servicos a monitorar, separados por virgula
 #   --beat-url URL      base do ping de heartbeat, sem a chave
 #                       (default: https://api.ilert.com/api/v1/heartbeats)
 #   --no-heartbeat      nao configura heartbeat
@@ -57,7 +60,7 @@
 #===============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="2.15.0"
+SCRIPT_VERSION="2.16.1"
 BIN_DIR="/usr/local/bin"
 ENV_FILE="/etc/ilert.env"
 API_URL="https://api.ilert.com/api/events"
@@ -169,7 +172,13 @@ write_file() { # write_file <path> <mode>  (conteudo via stdin)
 #------------------------------------------------------------------------------
 # argumentos
 #------------------------------------------------------------------------------
-usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+# Imprime o cabecalho inteiro, delimitado pelas duas reguas '#====='. Faixa
+# fixa de linhas quebrava em silencio a cada flag nova: o help truncava no meio
+# e as ultimas opcoes sumiam sem ninguem perceber.
+usage() {
+  awk 'NR>1 && /^#={10,}/ {n++; next} n==1 {print}' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -378,6 +387,9 @@ EOF
 #   MONIT_HOST=\$(hostname) MONIT_SERVICE=teste MONIT_DESCRIPTION="ping manual" \\
 #   MONIT_EVENT=Test MONIT_DATE="\$(date)" $BIN_DIR/ilert.sh ALERT HIGH 3 manual
 #
+# ILERT_SUPERSEDE=0 desliga o fechamento automatico do warning quando o
+# critico do mesmo assunto abre (convencao <algo>-warn / <algo>-crit).
+#
 # LOGS DE FALHA: journalctl -t ilert
 #===============================================================================
 set -u
@@ -466,6 +478,28 @@ if [ "\$EVT" = RESOLVE ] && [ "\$DELAY" -gt 0 ]; then
   # se nao conseguiu gravar o marcador, envia agora (falhar aberto e pior)
 fi
 [ "\$EVT" = ALERT ] && rm -f "\$MARKER" 2>/dev/null
+
+# --- Escalonamento: o critico absorve o warning ---------------------------
+# Convencao de sufixos: <algo>-warn e <algo>-crit descrevem o MESMO assunto em
+# dois niveis. Quando o critico abre, o warning virou ruido: o operador ja foi
+# acordado pelo HIGH e o LOW so ocupa espaco na lista. Entao o ALERT do critico
+# fecha o warning correspondente.
+# O warning reaparece sozinho depois: o teste do Monit continua casando e o
+# 'repeat every' reemite dentro da janela, entao nada se perde de vista.
+if [ "\$EVT" = ALERT ] && [ "\${ILERT_SUPERSEDE:-1}" = 1 ]; then
+  case "\$SUFFIX" in
+    *-crit)
+      _warn_sfx="\${SUFFIX%-crit}-warn"
+      _warn_marker="\$STATE_DIR/\$(printf '%s' "\$MONIT_HOST/\$MONIT_SERVICE/\$_warn_sfx" \\
+                     | tr -c 'a-zA-Z0-9_.-' '_')"
+      rm -f "\$_warn_marker" 2>/dev/null
+      ILERT_SUPERSEDE=0 ILERT_RESOLVE_DELAY=0 \\
+      MONIT_DESCRIPTION="superado pelo alerta critico" \\
+      MONIT_EVENT="Escalonado para critico" \\
+        "\$0" RESOLVE "\$PRIO" "\$SEV" "\$_warn_sfx" >/dev/null 2>&1 || true
+      ;;
+  esac
+fi
 
 CODE=\$(curl -sS -m 10 --retry 3 --retry-delay 2 -o /dev/null -w '%{http_code}' \\
   -X POST "\$API" -H 'Content-Type: application/json' --data-binary "\$BODY" 2>/dev/null)
