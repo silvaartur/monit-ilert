@@ -79,6 +79,7 @@ Prefira `--key-file` a `--key`: argumentos de linha de comando aparecem em `ps` 
 | `--ports LISTA` | Serviços TCP (veja formato abaixo) |
 | `--gateway IP` | Host do check ICMP interno |
 | `--auto-restart MODO` | `safe` (default), `all` ou `none` — veja abaixo |
+| `--warn-priority P` | `LOW` (default) ou `HIGH` para warnings de recurso |
 | `--swap-warn N` | Limiar de warning de swap em % (default 10) |
 | `--swap-crit N` | Limiar de critical de swap em % (default 30) |
 | `--ping-target IP` | Alvo externo de ICMP e DNS (default `1.1.1.1`) |
@@ -103,7 +104,7 @@ chmod +x install-monit-ilert.sh
 sudo ./install-monit-ilert.sh --host $(hostname)
 ```
 
-**Não desinstale antes de atualizar.** Reexecutar é mais seguro: o Monit continua rodando durante o processo (no fim é `reload`, não `stop`+`start`), os arquivos substituídos ganham backup `.bak-<timestamp>`, e se o `monit -t` falhar o script **restaura tudo automaticamente** antes de sair.
+**Não desinstale antes de atualizar.** Reexecutar é mais seguro: o Monit continua rodando durante o processo (no fim é `reload`, não `stop`+`start`), os arquivos substituídos ganham backup em `/var/backups/monit-ilert/`, e se o `monit -t` falhar o script **restaura tudo automaticamente** antes de sair.
 
 Depois de atualizar, confira:
 
@@ -190,6 +191,7 @@ Protocolos suportados pelo Monit: `http`, `https`, `mysql`, `pgsql`, `redis`, `m
 /etc/monit/conf.d/10-services.conf
 /etc/monit/conf.d/15-ports.conf
 /var/lib/ilert/pending/               marcadores de resolve adiado
+/var/backups/monit-ilert/             backups dos arquivos substituídos
 ```
 
 Caminhos variam em RHEL (`/etc/monitrc`, `/etc/monit.d/`).
@@ -244,6 +246,16 @@ Os defaults saem do hardware, não de números redondos:
 
 Depois de 1–2 semanas rodando, ajuste com dados reais: instale `sysstat` e use **p95 + 20%** como warning.
 
+## Prioridades
+
+Todo alerta chega no formato `<host> / <serviço>: <descrição>`.
+
+**Falha de disponibilidade é `HIGH`** — processo caído, porta fora, socket inacessível, disco ou memória em nível crítico. Aciona a escalation policy.
+
+**Warning de recurso é `LOW`** — load, memória, swap, disco e CPU nos limiares de aviso. Registra no ilert, aparece na lista e no app, mas não escala. Sem isso, disco em 86% e disco em 96% geram dois alertas `HIGH` do mesmo assunto e acordam alguém duas vezes pelo mesmo problema.
+
+Para voltar ao comportamento anterior: `--warn-priority HIGH`.
+
 ## Anti-flapping
 
 Um serviço em crash loop geraria pares ALERT/RESOLVE. Como cada RESOLVE fecha o alerta, o ALERT seguinte abre um **novo** — a deduplicação por `alertKey` só vale enquanto o alerta está aberto. Resultado: N alertas, N notificações, N escalations.
@@ -280,7 +292,7 @@ curl -i "<a URL completa do monitor>"
 
 Se a doc do ilert mostrar `${YOUR-APIKEY}` e você colar isso literalmente no bash, o shell interpreta como "valor de `$YOUR`, ou `APIKEY` se não existir" e pinga o endpoint errado. Use a chave crua.
 
-**`Connection failed` num socket unix com o serviço saudável.** Se a unit do Monit tem `ProtectSystem=strict` ou `full`, `/run` e `/var` ficam somente-leitura para ele — e `connect()` num socket unix exige escrita no arquivo do socket. O mesmo sandbox impede o `ilert.sh` de gravar os marcadores de resolve adiado, desligando o anti-flapping em silêncio. Verifique com `systemctl show monit -p ProtectSystem`; o instalador detecta e cria um drop-in com `ReadWritePaths` para os diretórios de socket usados no host.
+**`Cannot create unix socket` / `Connection failed` com o serviço saudável.** A mensagem engana: o Monit não tenta criar o arquivo `.sock`. Para conectar num socket unix o cliente cria seu próprio endpoint local e chama `connect()` — a mensagem cobre a operação toda. O teste é só "esse socket aceita conexão?". Se a unit do Monit tem `ProtectSystem=strict` ou `full`, `/run` e `/var` ficam somente-leitura para ele — e `connect()` num socket unix exige escrita no arquivo do socket. O mesmo sandbox impede o `ilert.sh` de gravar os marcadores de resolve adiado, desligando o anti-flapping em silêncio. Verifique com `systemctl show monit -p ProtectSystem`; o instalador detecta e cria um drop-in com `ReadWritePaths` para os diretórios de socket usados no host.
 
 **Alerta chega como `status failed (1) -- no output`.** O Monit captura o stdout do programa e coloca na descrição. Se um script seu não imprime nada ao falhar, o alerta fica sem informação — imprima o erro no stdout.
 
@@ -310,7 +322,7 @@ ilert.env
 sudo ./install-monit-ilert.sh --uninstall
 ```
 
-Remove os scripts, os arquivos de config gerados e o diretório de estado. **Preserva** `/etc/ilert.env`, o `monitrc` e os backups `.bak-*` — remoção de segredo e de config base fica manual, de propósito.
+Remove os scripts, os arquivos de config gerados e o diretório de estado. **Preserva** `/etc/ilert.env`, o `monitrc` e os backups em `/var/backups/monit-ilert/` — remoção de segredo e de config base fica manual, de propósito.
 
 ## Requisitos
 
