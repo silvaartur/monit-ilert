@@ -256,6 +256,14 @@ Todo alerta chega no formato `<host> / <serviço>: <descrição>`.
 
 Para voltar ao comportamento anterior: `--warn-priority HIGH`.
 
+### O crítico absorve o warning
+
+Os sufixos seguem a convenção `<algo>-warn` e `<algo>-crit` para o mesmo assunto em dois níveis. Quando o crítico abre, o `ilert.sh` **fecha o warning correspondente** antes de enviar o alerta: você já foi acordado pelo `HIGH`, e o `LOW` do mesmo disco só ocuparia espaço na lista.
+
+Se o crítico se resolver mas o valor continuar acima do limiar de aviso, o warning reaparece sozinho — o teste do Monit segue casando e o `repeat every` reemite dentro da janela.
+
+Desligue com `ILERT_SUPERSEDE=0` em `/etc/ilert.env`.
+
 ## Anti-flapping
 
 Um serviço em crash loop geraria pares ALERT/RESOLVE. Como cada RESOLVE fecha o alerta, o ALERT seguinte abre um **novo** — a deduplicação por `alertKey` só vale enquanto o alerta está aberto. Resultado: N alertas, N notificações, N escalations.
