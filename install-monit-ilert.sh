@@ -31,6 +31,7 @@
 #   --gateway IP        host para o check de conectividade ICMP
 #   --swap-warn N       % de swap para warning (default 10)
 #   --swap-crit N       % de swap para critical (default 30)
+#   --warn-priority P   LOW (default) ou HIGH para warnings de recurso
 #   --auto-restart MODO safe (default) = reinicia nginx/apache/php-fpm/redis
 #                       all = inclui bancos e docker | none = so alerta.
 #                       Em qualquer modo o Monit desiste apos 3 restarts em
@@ -56,7 +57,7 @@
 #===============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="2.12.1"
+SCRIPT_VERSION="2.15.0"
 BIN_DIR="/usr/local/bin"
 ENV_FILE="/etc/ilert.env"
 API_URL="https://api.ilert.com/api/events"
@@ -90,6 +91,11 @@ PING_TARGET="${ILERT_PING_TARGET:-1.1.1.1}"
 #               'all'  = inclui bancos e docker (leia o README antes)
 #               'none' = so alerta
 RESTART_MODE="${ILERT_RESTART_MODE:-safe}"
+# Warnings de recurso (load/mem/swap/disco/cpu) saem como LOW: registram no
+# ilert sem acionar a escalation policy. Sem isso, disco em 86% e em 96% geram
+# DOIS alertas HIGH do mesmo assunto, acordando alguem duas vezes pelo mesmo
+# problema. Falhas de disponibilidade (processo caido, porta fora) seguem HIGH.
+WARN_PRIO="${ILERT_WARN_PRIORITY:-LOW}"
 # auto  = testa ICMP na instalacao e cai para TCP 443 quando bloqueado
 # icmp  = forca ICMP | tcp = forca TCP 443 | none = sem check de rede
 CONNECTIVITY="${ILERT_CONNECTIVITY:-auto}"
@@ -123,8 +129,17 @@ run() {
   fi
 }
 
+# Backups NAO ficam ao lado do original: em /etc/monit/conf.d isso e inofensivo,
+# mas em /usr/local/bin gera arquivos executaveis no PATH que confundem
+# auditoria e ficam para sempre. Todos vao para um diretorio proprio.
+BACKUP_DIR="/var/backups/monit-ilert"
+
+backup_path() { # backup_path <arquivo> -> caminho do backup
+  printf '%s/%s.bak-%s' "$BACKUP_DIR" "$(printf '%s' "${1#/}" | tr '/' '_')" "$STAMP"
+}
+
 write_file() { # write_file <path> <mode>  (conteudo via stdin)
-  local path="$1" mode="$2" tmp
+  local path="$1" mode="$2" tmp bak
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '  [dry-run] escreveria %s (%s)\n' "$path" "$mode"
     cat >/dev/null
@@ -133,14 +148,18 @@ write_file() { # write_file <path> <mode>  (conteudo via stdin)
   tmp="$(mktemp)"
   cat >"$tmp"
   # Idempotencia: se o conteudo nao mudou, nao reescreve nem cria backup.
-  # Sem isso, cada re-execucao acumula um .bak inutil no /etc.
+  # Sem isso, cada re-execucao acumula um .bak inutil.
   if [ -f "$path" ] && cmp -s "$tmp" "$path"; then
     rm -f "$tmp"
     ok "inalterado $path"
     return
   fi
-  [ -f "$path" ] && cp -a "$path" "${path}.bak-${STAMP}" && \
-    warn "backup: ${path}.bak-${STAMP}"
+  if [ -f "$path" ]; then
+    mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
+    bak="$(backup_path "$path")"
+    cp -a "$path" "$bak"
+    warn "backup: $bak"
+  fi
   install -o root -g root -m "$mode" "$tmp" "$path"
   rm -f "$tmp"
   WRITTEN+=("$path")
@@ -167,6 +186,7 @@ while [ $# -gt 0 ]; do
     --connectivity)    CONNECTIVITY="${2:?}"; shift ;;
     --resolve-name)    RESOLVE_NAME="${2:?}"; shift ;;
     --auto-restart)    RESTART_MODE="${2:?}"; shift ;;
+    --warn-priority)   WARN_PRIO="${2:?}"; shift ;;
     --swap-warn)       ILERT_SWAP_WARN="${2:?}"; shift ;;
     --swap-crit)       ILERT_SWAP_CRIT="${2:?}"; shift ;;
     --ports)           PORTS_ARG="${2:?}"; shift ;;
@@ -395,22 +415,17 @@ esc() { local s=\$1
   s=\${s//\$'\n'/\\\\n}; s=\${s//\$'\r'/\\\\r}; s=\${s//\$'\t'/\\\\t}
   printf '%s' "\$s"; }
 
-# O summary e o que aparece no push, no SMS e na lista de alertas. Sem o host,
-# "root: space usage 90.8%" nao diz QUAL maquina esta com o disco cheio. O
-# 'check system' ja usa o hostname como nome do check, entao ali o prefixo
-# seria redundante - dai o teste antes de prefixar.
-# Comparar com os DOIS nomes: o 'check system' usa o hostname real como nome do
-# check, entao com ILERT_HOST configurado a comparacao simples falharia e o
-# summary sairia "web-prod-01 / docker-01: ...", citando a mesma maquina duas
-# vezes com nomes diferentes.
+# Formato UNICO em toda a lista: "<host> / <servico>: <descricao>".
+# O 'check system' usa o hostname como nome do check, o que produziria
+# "db-01 / db-01:"; nesse caso o rotulo vira 'sistema'. Comparar com os dois
+# nomes porque, com ILERT_HOST configurado, o nome exibido difere do nome do
+# check e a comparacao simples deixaria passar.
 if [ "\$MONIT_SERVICE" = "\$MONIT_HOST" ] || [ "\$MONIT_SERVICE" = "\$_REAL_HOST" ]; then
-  # Usa o nome EXIBIDO, nao o do check: com ILERT_HOST configurado, sair
-  # "docker-01: swap" aqui e "web-prod-01 / root: disco" ali mostraria a mesma
-  # maquina com dois nomes na mesma lista de alertas.
-  SUMMARY="\$MONIT_HOST: \$MONIT_DESCRIPTION"
+  SVC_LABEL="sistema"
 else
-  SUMMARY="\$MONIT_HOST / \$MONIT_SERVICE: \$MONIT_DESCRIPTION"
+  SVC_LABEL="\$MONIT_SERVICE"
 fi
+SUMMARY="\$MONIT_HOST / \$SVC_LABEL: \$MONIT_DESCRIPTION"
 
 BODY="{\\"integrationKey\\":\\"\$KEY\\",
  \\"eventType\\":\\"\$EVT\\",
@@ -697,7 +712,7 @@ write_monitrc() {
     warn "preservando include de $MONIT_DIR/conf-enabled"
   fi
   if [ -f "$MONITRC" ] && grep -qE '^\s*(check|include)' "$MONITRC" 2>/dev/null; then
-    warn "monitrc atual tem conteudo proprio - backup em ${MONITRC}.bak-${STAMP}"
+    warn "monitrc atual tem conteudo proprio - backup em $(backup_path "$MONITRC")"
     if ! confirm "  Sobrescrever o monitrc?" y; then
       warn "monitrc mantido; apenas os arquivos de $CONF_D serao gerados"
       return
@@ -707,7 +722,7 @@ write_monitrc() {
   write_file "$MONITRC" 0700 <<EOF
 ###############################################################################
 # monitrc - gerado por install-monit-ilert.sh v$SCRIPT_VERSION em $(date -Iseconds)
-# Backup do original (se havia): ${MONITRC}.bak-${STAMP}
+# Backup do original (se havia) em $BACKUP_DIR
 ###############################################################################
 
 # Ciclo de 60s: em todo conf.d, "N cycles" == N minutos.
@@ -863,20 +878,20 @@ gen_system_checks() {
     echo
     echo "  # ---- LOAD (5min; a de 1min dispara em qualquer apt upgrade) ----"
     emit_pair "if loadavg (5min) > $LOAD_CRIT for 3 cycles" HIGH 1 load-crit 30
-    emit_pair "if loadavg (5min) > $LOAD_WARN for 5 cycles" HIGH 2 load-warn 60
+    emit_pair "if loadavg (5min) > $LOAD_WARN for 5 cycles" "$WARN_PRIO" 3 load-warn 60
     echo
     echo "  # ---- CPU (system e iowait dizem mais que 'user') ----"
-    emit_pair "if cpu usage (system) > 40% for 5 cycles" HIGH 2 cpu-sys 60
-    emit_pair "if cpu usage (wait) > 30% for 5 cycles" HIGH 2 cpu-wait 60
+    emit_pair "if cpu usage (system) > 40% for 5 cycles" "$WARN_PRIO" 3 cpu-sys 60
+    emit_pair "if cpu usage (wait) > 30% for 5 cycles" "$WARN_PRIO" 3 cpu-wait 60
     echo
     echo "  # ---- MEMORIA (o Monit ja desconta buffers/cache) ----"
     emit_pair "if memory usage > ${MEM_CRIT}% for 3 cycles" HIGH 1 mem-crit 30
-    emit_pair "if memory usage > ${MEM_WARN}% for 5 cycles" HIGH 2 mem-warn 60
+    emit_pair "if memory usage > ${MEM_WARN}% for 5 cycles" "$WARN_PRIO" 3 mem-warn 60
     if [ "$HAS_SWAP" -eq 1 ]; then
       echo
       echo "  # ---- SWAP (sinal, nao recurso: debounce longo de proposito) ----"
       emit_pair "if swap usage > ${SWAP_CRIT}% for 3 cycles" HIGH 1 swap-crit 30
-      emit_pair "if swap usage > ${SWAP_WARN}% for 10 cycles" HIGH 2 swap-warn 60
+      emit_pair "if swap usage > ${SWAP_WARN}% for 10 cycles" "$WARN_PRIO" 3 swap-warn 60
     fi
   } > /tmp/00-system.conf
   write_file "$CONF_D/00-system.conf" 0600 < /tmp/00-system.conf
@@ -907,8 +922,8 @@ gen_filesystem_checks() {
       echo "check filesystem $name with path $mnt"
       emit_pair "if space free < ${gc} MB for 2 cycles" HIGH 1 "disk-abs-crit" 30
       emit_pair "if space usage > ${pc}% for 2 cycles"  HIGH 1 "disk-pct-crit" 30
-      emit_pair "if space free < ${gw} MB for 5 cycles" HIGH 2 "disk-abs-warn" 120
-      emit_pair "if space usage > ${pw}% for 5 cycles"  HIGH 2 "disk-pct-warn" 120
+      emit_pair "if space free < ${gw} MB for 5 cycles" "$WARN_PRIO" 3 "disk-abs-warn" 120
+      emit_pair "if space usage > ${pw}% for 5 cycles"  "$WARN_PRIO" 3 "disk-pct-warn" 120
       echo "  # inodes enchem sozinhos, com o disco 'vazio'"
       emit_pair "if inode usage > 90% for 3 cycles" HIGH 1 "inode" 60
       echo
@@ -1159,8 +1174,8 @@ rollback() {
   local f reload=0
   for f in ${WRITTEN[@]+"${WRITTEN[@]}"}; do
     case "$f" in */systemd/*) reload=1 ;; esac
-    if [ -f "${f}.bak-${STAMP}" ]; then
-      mv -f "${f}.bak-${STAMP}" "$f"
+    if [ -f "$(backup_path "$f")" ]; then
+      mv -f "$(backup_path "$f")" "$f"
       warn "restaurado $f"
     else
       rm -f "$f"
@@ -1227,7 +1242,7 @@ gen_service_checks() {
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
           restart_ok "$s" && emit_restart_policy "$cn"
           emit_pair "if failed port 80 protocol http request \"/\" for 3 cycles" HIGH 2 http 30
-          emit_pair "if cpu > 80% for 10 cycles" HIGH 2 cpu 120
+          emit_pair "if cpu > 80% for 10 cycles" "$WARN_PRIO" 3 cpu 120
           echo
         } >> "$out"
         ;;
@@ -1242,7 +1257,7 @@ gen_service_checks() {
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
           restart_ok "$s" && emit_restart_policy "$cn"
           emit_pair "if failed port 80 protocol http request \"/\" for 3 cycles" HIGH 2 http 30
-          emit_pair "if children > 250 for 5 cycles" HIGH 2 children 120
+          emit_pair "if children > 250 for 5 cycles" "$WARN_PRIO" 3 children 120
           echo
         } >> "$out"
         ;;
@@ -1258,7 +1273,7 @@ gen_service_checks() {
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
           restart_ok "$s" && emit_restart_policy "$cn"
           emit_pair "if failed host 127.0.0.1 port 3306 protocol mysql for 3 cycles" HIGH 1 port 30
-          emit_pair "if memory > 70% for 10 cycles" HIGH 2 mem 120
+          emit_pair "if memory > 70% for 10 cycles" "$WARN_PRIO" 3 mem 120
           echo
         } >> "$out"
         ;;
@@ -1277,7 +1292,7 @@ gen_service_checks() {
           # $pgname, nao $cn: o unmonitor precisa mirar o nome real do check
           restart_ok "$s" && emit_restart_policy "$pgname"
           emit_pair "if failed host 127.0.0.1 port 5432 protocol pgsql for 3 cycles" HIGH 1 port 30
-          emit_pair "if memory > 70% for 10 cycles" HIGH 2 mem 120
+          emit_pair "if memory > 70% for 10 cycles" "$WARN_PRIO" 3 mem 120
           echo
         } >> "$out"
         ;;
@@ -1350,8 +1365,8 @@ gen_service_checks() {
             echo "  # nenhum socket/porta de pool encontrado - so o PID e checado."
             echo "  # Verifique 'listen =' em $pooldir/*.conf e adicione a mao."
           fi
-          emit_pair "if children > 200 for 5 cycles" HIGH 2 children 120
-          emit_pair "if total memory > 60% for 10 cycles" HIGH 2 mem 120
+          emit_pair "if children > 200 for 5 cycles" "$WARN_PRIO" 3 children 120
+          emit_pair "if total memory > 60% for 10 cycles" "$WARN_PRIO" 3 mem 120
           echo
         } >> "$out"
         ;;
@@ -1379,8 +1394,8 @@ gen_service_checks() {
             emit_pair "if failed unixsocket $rsock for 3 cycles" HIGH 2 socket 30
           fi
           echo "  # Redis estourando memoria comeca a evictar chaves em silencio"
-          emit_pair "if memory > 70% for 10 cycles" HIGH 2 mem 120
-          emit_pair "if cpu > 80% for 10 cycles" HIGH 2 cpu 120
+          emit_pair "if memory > 70% for 10 cycles" "$WARN_PRIO" 3 mem 120
+          emit_pair "if cpu > 80% for 10 cycles" "$WARN_PRIO" 3 cpu 120
           echo
         } >> "$out"
         ;;
@@ -1595,6 +1610,47 @@ send_test_event() {
   fi
 }
 
+# Um erro de ambiente (sandbox do systemd, socket em caminho errado, porta que
+# nao escuta) so apareceria como enxurrada de alertas minutos depois. Aqui o
+# Monit e forcado a avaliar tudo agora e o resultado vai para a tela.
+post_install_check() {
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  head1 "13. Verificacao dos checks"
+  monit validate >/dev/null 2>&1 || true
+  sleep 8
+  local out failed
+  out="$(monit summary 2>/dev/null || true)"
+  if [ -z "$out" ]; then
+    warn "nao consegui ler 'monit summary' - rode a mao daqui a um minuto"
+    return 0
+  fi
+  # Colunas: Service Name | Status | Type. Qualquer coisa fora de OK/Initializing
+  failed="$(printf '%s\n' "$out" | awk 'NR>2 && $0 !~ /(OK|Initializing|Waiting)/ && NF>1')"
+  if [ -z "$failed" ]; then
+    ok "todos os checks passaram"
+    return 0
+  fi
+  warn "checks com problema logo apos a instalacao:"
+  printf '%s\n' "$failed" | sed 's/^/    /'
+  # Diagnostico do caso mais comum e mais dificil de adivinhar
+  if printf '%s\n' "$failed" | grep -qi 'connection failed'; then
+    local prot
+    prot="$(systemctl show monit -p ProtectSystem --value 2>/dev/null || true)"
+    case "$prot" in
+      strict|full|yes)
+        warn "ProtectSystem=$prot ativo: /run fica somente-leitura para o monit"
+        warn "e conectar em socket unix exige escrita no arquivo do socket."
+        warn "Confira 'systemctl show monit -p ReadWritePaths' e reinstale se vazio."
+        ;;
+      *)
+        warn "'Connection failed' em socket/porta: confira se o servico escuta"
+        warn "no caminho configurado (ss -lx | grep <socket>)."
+        ;;
+    esac
+  fi
+  warn "corrija antes que virem alerta: cada check falhando abre um alerta"
+}
+
 summary() {
   head1 "Resumo"
   cat <<EOF
@@ -1645,7 +1701,7 @@ uninstall() {
     run rm -f "$CONF_D/${f}.conf"
   done
   run rm -rf /var/lib/ilert
-  warn "mantidos: $ENV_FILE, $MONITRC e os backups .bak-*"
+  warn "mantidos: $ENV_FILE, $MONITRC e os backups em $BACKUP_DIR"
   ok "desinstalado"
   exit 0
 }
@@ -1672,6 +1728,7 @@ main() {
   ensure_monit_sandbox
   validate_and_start
   send_test_event
+  post_install_check
   summary
 }
 
