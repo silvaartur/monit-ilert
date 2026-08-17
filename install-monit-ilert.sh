@@ -60,7 +60,7 @@
 #===============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="2.16.1"
+SCRIPT_VERSION="2.20.1"
 BIN_DIR="/usr/local/bin"
 ENV_FILE="/etc/ilert.env"
 API_URL="https://api.ilert.com/api/events"
@@ -465,6 +465,17 @@ DELAY="\${ILERT_RESOLVE_DELAY:-300}"
 MARKER="\$STATE_DIR/\$(printf '%s' "\$AKEY" | tr -c 'a-zA-Z0-9_.-' '_')"
 mkdir -p "\$STATE_DIR" 2>/dev/null || true
 
+# O adiamento existe para crash loop: servico que cai e volta em segundos
+# geraria pares ALERT/RESOLVE e, a cada RESOLVE, o ALERT seguinte abriria um
+# alerta NOVO. Isso vale para disponibilidade (processo, porta, socket), nao
+# para metricas de recurso: disco e swap nao oscilam em segundos, e segurar o
+# fechamento por 5 minutos so atrasa a boa noticia sem evitar ruido nenhum.
+case "\$SUFFIX" in
+  pid|port*|sock*|http*|tcp*|icmp|dns|beat|resolver|flush|pingname|restartloop|children)
+    ;;                # sujeito a flapping: mantem o adiamento
+  *) DELAY=0 ;;       # metrica de recurso: resolve na hora
+esac
+
 if [ "\$EVT" = RESOLVE ] && [ "\$DELAY" -gt 0 ]; then
   # Uma linha por campo; quebras de linha viram espaco para nao corromper o
   # formato. O leitor (ilert-flush.sh) faz parsing literal, sem interpretar.
@@ -479,16 +490,28 @@ if [ "\$EVT" = RESOLVE ] && [ "\$DELAY" -gt 0 ]; then
 fi
 [ "\$EVT" = ALERT ] && rm -f "\$MARKER" 2>/dev/null
 
-# --- Escalonamento: o critico absorve o warning ---------------------------
-# Convencao de sufixos: <algo>-warn e <algo>-crit descrevem o MESMO assunto em
-# dois niveis. Quando o critico abre, o warning virou ruido: o operador ja foi
-# acordado pelo HIGH e o LOW so ocupa espaco na lista. Entao o ALERT do critico
-# fecha o warning correspondente.
-# O warning reaparece sozinho depois: o teste do Monit continua casando e o
-# 'repeat every' reemite dentro da janela, entao nada se perde de vista.
-if [ "\$EVT" = ALERT ] && [ "\${ILERT_SUPERSEDE:-1}" = 1 ]; then
-  case "\$SUFFIX" in
-    *-crit)
+# --- Bandas exclusivas: warning e critico nunca abertos ao mesmo tempo -----
+# Os dois testes do Monit se SOBREPOEM: 'swap > 10%' continua verdadeiro com
+# swap em 40%, entao ambos disparam. O Monit nao tem condicao de faixa
+# (verificado: 'if X > 10% and X < 30%' passa no monit -t mas e avaliado como
+# dois testes independentes, disparando com qualquer valor abaixo de 30%).
+# A exclusividade e feita aqui, com um marcador em disco:
+#   ALERT -crit   -> grava marcador, fecha o -warn, envia o HIGH
+#   ALERT -warn   -> se o marcador existe, NAO envia (o critico esta no comando)
+#   RESOLVE -crit -> apaga o marcador; o -warn volta a emitir no proximo repeat
+# Sem consultar API: o marcador tem a mesma informacao, sem rede, sem
+# credencial extra no host e sem latencia no caminho do alerta.
+CRIT_DIR="\${ILERT_CRIT_DIR:-/var/lib/ilert/crit}"
+_base="\${SUFFIX%-crit}"; _base="\${_base%-warn}"
+CRIT_MARK="\$CRIT_DIR/\$(printf '%s' "\$MONIT_HOST/\$MONIT_SERVICE/\$_base" \\
+             | tr -c 'a-zA-Z0-9_.-' '_')"
+
+if [ "\${ILERT_SUPERSEDE:-1}" = 1 ]; then
+  case "\$EVT:\$SUFFIX" in
+    ALERT:*-crit)
+      mkdir -p "\$CRIT_DIR" 2>/dev/null || true
+      : > "\$CRIT_MARK" 2>/dev/null || true
+      # fecha o warning do mesmo assunto antes de abrir o critico
       _warn_sfx="\${SUFFIX%-crit}-warn"
       _warn_marker="\$STATE_DIR/\$(printf '%s' "\$MONIT_HOST/\$MONIT_SERVICE/\$_warn_sfx" \\
                      | tr -c 'a-zA-Z0-9_.-' '_')"
@@ -497,6 +520,29 @@ if [ "\$EVT" = ALERT ] && [ "\${ILERT_SUPERSEDE:-1}" = 1 ]; then
       MONIT_DESCRIPTION="superado pelo alerta critico" \\
       MONIT_EVENT="Escalonado para critico" \\
         "\$0" RESOLVE "\$PRIO" "\$SEV" "\$_warn_sfx" >/dev/null 2>&1 || true
+      ;;
+    ALERT:*-warn)
+      # critico aberto para o mesmo assunto: o warning seria ruido duplicado.
+      # Sem isto, o 'repeat every' do warning ressuscitaria um alerta LOW a
+      # cada janela, mesmo com o HIGH aberto.
+      if [ -f "\$CRIT_MARK" ]; then
+        # Marcador orfao: se o critico deixou de ser reportado sem RESOLVE
+        # (monit parado, check removido, servico em unmonitor, reinstalacao),
+        # o warning ficaria silenciado para sempre - falha silenciosa. Um
+        # critico VIVO regrava o marcador a cada repeat (10 ciclos), entao
+        # idade alta so acontece em orfao.
+        _ttl="\${ILERT_CRIT_TTL:-7200}"
+        _age=\$(( \$(date +%s) - \$(stat -c %Y "\$CRIT_MARK" 2>/dev/null || date +%s) ))
+        if [ "\$_age" -lt "\$_ttl" ]; then
+          exit 0
+        fi
+        rm -f "\$CRIT_MARK" 2>/dev/null
+        logger -t ilert "marcador critico orfao (\${_age}s) removido: \$_base"
+      fi
+      ;;
+    RESOLVE:*-crit)
+      # saiu da faixa critica: o warning volta a valer
+      rm -f "\$CRIT_MARK" 2>/dev/null
       ;;
   esac
 fi
@@ -703,32 +749,45 @@ compute_thresholds() {
 
 # limiares de disco derivados do tamanho: percentual + valor absoluto
 # regra: warn livre = 10%% do disco (min 2G, max 20G); crit = 3%% (min 1G, max 8G)
-# $1 = tamanho em GB -> "pct_warn pct_crit mb_warn mb_crit"
+# $1 = tamanho em GB -> "mb_warn mb_crit"
 #
-# Em MB, nao GB: um piso fixo de 2 GB fazia /boot (tipicamente 1-2 GB) alertar
-# desde o primeiro dia, sem nunca representar um problema real. Os limiares
-# absolutos agora escalam com o volume, com pisos pensados no uso pratico:
-# 512 MB no warning cobre a instalacao de um kernel novo; 256 MB no critico
-# e o ponto em que a proxima atualizacao falha.
+# UM limiar por nivel, em MB de espaco livre. Percentual e valor absoluto medem
+# a mesma coisa em unidades diferentes: manter os dois gera dois alertas para o
+# mesmo disco, sempre. A regra percentual e convertida para MB e vale a que
+# dispara PRIMEIRO (a maior), preservando as duas protecoes num teste so:
+#   - disco grande: o percentual vence (10% de 4 TB sao 400 GB, ainda tranquilo)
+#   - disco pequeno: o piso absoluto vence (20% de 2 GB sao 400 MB, apertado)
 disk_thresholds() {
-  local size="$1" size_mb mw mc
+  local size="$1" size_mb pct_w pct_c abs_w abs_c mw mc
   size_mb=$(( size * 1024 ))
-  mw=$(( size_mb / 5 ))    # 20%
-  mc=$(( size_mb / 10 ))   # 10%
+
   if [ "$size" -le 10 ]; then
-    # volumes pequenos (/boot, /boot/efi): piso pequeno mas util
-    [ "$mw" -lt 512 ] && mw=512
-    [ "$mc" -lt 256 ] && mc=256
-    echo "80 90 $mw $mc"
+    pct_w=20; pct_c=10          # /boot, /boot/efi
+    abs_w=512; abs_c=256        # cabe um kernel novo / proxima atualizacao falha
+  elif [ "$size" -le 200 ]; then
+    pct_w=15; pct_c=7
+    abs_w=2048; abs_c=1024
   else
-    # volumes grandes: teto para nao exigir centenas de GB livres
-    mw=$(( size_mb / 10 )); [ "$mw" -gt 20480 ] && mw=20480
-    mc=$(( size_mb / 33 )); [ "$mc" -gt 8192 ]  && mc=8192
-    [ "$mw" -lt 2048 ] && mw=2048
-    [ "$mc" -lt 1024 ] && mc=1024
-    if [ "$size" -le 200 ]; then echo "85 93 $mw $mc"
-    else echo "88 95 $mw $mc"; fi
+    pct_w=12; pct_c=5
+    # Piso = valor da faixa anterior no seu limite superior (200G a 15% e 7%).
+    # Sem isso a curva quebra: um volume de 205G exigiria MENOS espaco livre
+    # que um de 200G, ou seja, avisaria mais tarde por ser maior.
+    abs_w=30720; abs_c=14336
   fi
+
+  # percentual convertido para MB livres. Sem teto: num volume de 4 TB, 12%
+  # livres sao 480 GB e um teto de 50 GB adiaria o aviso para 99% de uso.
+  mw=$(( size_mb * pct_w / 100 ))
+  mc=$(( size_mb * pct_c / 100 ))
+
+  # Piso absoluto, tambem proporcional: 512 MB fixos num volume de 1 GB
+  # significariam alertar com metade do disco livre.
+  [ "$abs_w" -gt $(( size_mb / 4 )) ] && abs_w=$(( size_mb / 4 ))
+  [ "$abs_c" -gt $(( size_mb / 8 )) ] && abs_c=$(( size_mb / 8 ))
+  [ "$mw" -lt "$abs_w" ] && mw="$abs_w"
+  [ "$mc" -lt "$abs_c" ] && mc="$abs_c"
+
+  echo "$mw $mc"
 }
 
 #------------------------------------------------------------------------------
@@ -848,6 +907,38 @@ uniq_name() {
 
 register_name() { EXISTING_NAMES="${EXISTING_NAMES:- }$1 "; }
 
+# Portas realmente em escuta. Assumir a porta padrao gera alerta permanente
+# num servico saudavel: nginx so na 8080, MariaDB em 3307, Redis so em socket
+# unix. O instalador consulta o que existe antes de escrever o check.
+listening_ports() { # listening_ports [regex-do-processo] -> portas TCP, uma por linha
+  local re="${1:-.}"
+  if command -v ss >/dev/null 2>&1; then
+    ss -lntpH 2>/dev/null | awk -v re="$re" '
+      $0 ~ re { n = split($4, a, ":"); if (a[n] ~ /^[0-9]+$/) print a[n] }' | sort -un
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -lntp 2>/dev/null | awk -v re="$re" '
+      $0 ~ re { n = split($4, a, ":"); if (a[n] ~ /^[0-9]+$/) print a[n] }' | sort -un
+  fi
+}
+
+port_listening() { # port_listening <porta>
+  listening_ports . | grep -qx "$1"
+}
+
+# Escolhe a porta do check: a padrao se estiver em escuta; senao a primeira que
+# o processo estiver usando; senao vazio, e o teste e omitido com um comentario
+# explicando - melhor nenhum check do que um check que falha para sempre.
+pick_port() { # pick_port <porta-padrao> <regex-do-processo>
+  local want="$1" re="$2" found
+  if port_listening "$want"; then printf '%s' "$want"; return 0; fi
+  found="$(listening_ports "$re" | head -1 || true)"
+  [ -n "$found" ] && printf '%s' "$found"
+  # SEMPRE 0: sob 'set -e', devolver 1 aqui faria a atribuicao
+  # rport="$(pick_port ...)" abortar a geracao inteira quando o servico so
+  # escuta em socket unix - justamente o caso que este teste existe para tratar.
+  return 0
+}
+
 # emite par ALERT/RESOLVE
 emit_pair() { # emit_pair <condicao> <prio> <sev> <sufixo> [repeat_cycles]
   local cond="$1" prio="$2" sev="$3" sfx="$4" rep="${5:-}"
@@ -911,21 +1002,21 @@ gen_system_checks() {
     echo "check system $sysname"
     echo
     echo "  # ---- LOAD (5min; a de 1min dispara em qualquer apt upgrade) ----"
-    emit_pair "if loadavg (5min) > $LOAD_CRIT for 3 cycles" HIGH 1 load-crit 30
-    emit_pair "if loadavg (5min) > $LOAD_WARN for 5 cycles" "$WARN_PRIO" 3 load-warn 60
+    emit_pair "if loadavg (5min) > $LOAD_CRIT for 3 cycles" HIGH 1 load-crit 10
+    emit_pair "if loadavg (5min) > $LOAD_WARN for 5 cycles" "$WARN_PRIO" 3 load-warn 20
     echo
     echo "  # ---- CPU (system e iowait dizem mais que 'user') ----"
-    emit_pair "if cpu usage (system) > 40% for 5 cycles" "$WARN_PRIO" 3 cpu-sys 60
-    emit_pair "if cpu usage (wait) > 30% for 5 cycles" "$WARN_PRIO" 3 cpu-wait 60
+    emit_pair "if cpu usage (system) > 40% for 5 cycles" "$WARN_PRIO" 3 cpu-sys 20
+    emit_pair "if cpu usage (wait) > 30% for 5 cycles" "$WARN_PRIO" 3 cpu-wait 20
     echo
     echo "  # ---- MEMORIA (o Monit ja desconta buffers/cache) ----"
-    emit_pair "if memory usage > ${MEM_CRIT}% for 3 cycles" HIGH 1 mem-crit 30
-    emit_pair "if memory usage > ${MEM_WARN}% for 5 cycles" "$WARN_PRIO" 3 mem-warn 60
+    emit_pair "if memory usage > ${MEM_CRIT}% for 3 cycles" HIGH 1 mem-crit 10
+    emit_pair "if memory usage > ${MEM_WARN}% for 5 cycles" "$WARN_PRIO" 3 mem-warn 20
     if [ "$HAS_SWAP" -eq 1 ]; then
       echo
       echo "  # ---- SWAP (sinal, nao recurso: debounce longo de proposito) ----"
-      emit_pair "if swap usage > ${SWAP_CRIT}% for 3 cycles" HIGH 1 swap-crit 30
-      emit_pair "if swap usage > ${SWAP_WARN}% for 10 cycles" "$WARN_PRIO" 3 swap-warn 60
+      emit_pair "if swap usage > ${SWAP_CRIT}% for 3 cycles" HIGH 1 swap-crit 10
+      emit_pair "if swap usage > ${SWAP_WARN}% for 10 cycles" "$WARN_PRIO" 3 swap-warn 20
     fi
   } > /tmp/00-system.conf
   write_file "$CONF_D/00-system.conf" 0600 < /tmp/00-system.conf
@@ -949,17 +1040,19 @@ gen_filesystem_checks() {
     name="$(uniq_name "$(echo "$mnt" | sed 's|^/$|root|; s|^/||; s|/|_|g')")"
     register_name "$name"
     th="$(disk_thresholds "$size_gb")"
-    read -r pw pc gw gc <<< "$th"
-    printf '  %s (%sG) -> warn >%s%% ou <%sMB | crit >%s%% ou <%sMB\n' \
-      "$mnt" "$size_gb" "$pw" "$gw" "$pc" "$gc"
+    read -r gw gc <<< "$th"
+    pw=$(( 100 - (gw * 100 / (size_gb * 1024)) ))
+    pc=$(( 100 - (gc * 100 / (size_gb * 1024)) ))
+    printf '  %s (%sG) -> warn <%sMB livres (~%s%% uso) | crit <%sMB (~%s%% uso)\n' \
+      "$mnt" "$size_gb" "$gw" "$pw" "$gc" "$pc"
     {
       echo "check filesystem $name with path $mnt"
-      emit_pair "if space free < ${gc} MB for 2 cycles" HIGH 1 "disk-abs-crit" 30
-      emit_pair "if space usage > ${pc}% for 2 cycles"  HIGH 1 "disk-pct-crit" 30
-      emit_pair "if space free < ${gw} MB for 5 cycles" "$WARN_PRIO" 3 "disk-abs-warn" 120
-      emit_pair "if space usage > ${pw}% for 5 cycles"  "$WARN_PRIO" 3 "disk-pct-warn" 120
+      echo "  # ~${pc}% de uso neste volume"
+      emit_pair "if space free < ${gc} MB for 2 cycles" HIGH 1 "disk-crit" 10
+      echo "  # ~${pw}% de uso neste volume"
+      emit_pair "if space free < ${gw} MB for 5 cycles" "$WARN_PRIO" 3 "disk-warn" 20
       echo "  # inodes enchem sozinhos, com o disco 'vazio'"
-      emit_pair "if inode usage > 90% for 3 cycles" HIGH 1 "inode" 60
+      emit_pair "if inode usage > 90% for 3 cycles" HIGH 1 "inode" 20
       echo
     } >> "$out"
   done < <(df --output=source,fstype,size,target 2>/dev/null | tail -n +2 | \
@@ -1023,24 +1116,24 @@ gen_network_checks() {
     echo
     if [ -n "$GATEWAY" ]; then
       echo "check host gateway with address $GATEWAY"
-      emit_pair "if failed ping count 3 with timeout 5 seconds for 3 cycles" HIGH 1 icmp 30
+      emit_pair "if failed ping count 3 with timeout 5 seconds for 3 cycles" HIGH 1 icmp 10
       echo
     fi
     if [ "$ext_mode" = icmp ]; then
       echo "# Alvo por IP: nome misturaria falha de DNS com falha de rede."
       echo "check host internet with address $PING_TARGET"
-      emit_pair "if failed ping count 3 with timeout 5 seconds for 5 cycles" HIGH 2 icmp 60
+      emit_pair "if failed ping count 3 with timeout 5 seconds for 5 cycles" HIGH 2 icmp 20
       echo
     elif [ "$ext_mode" = tcp ]; then
       echo "# TCP 443 em vez de ICMP: independe de ICMP liberado no firewall."
       echo "check host internet with address $PING_TARGET"
-      emit_pair "if failed port 443 type tcp with timeout 5 seconds for 5 cycles" HIGH 2 tcp443 60
+      emit_pair "if failed port 443 type tcp with timeout 5 seconds for 5 cycles" HIGH 2 tcp443 20
       echo
     fi
     if [ -n "$ext_mode" ]; then
       echo "# Servidor DNS remoto responde? (nao testa o resolver local)"
       echo "check host dns with address $PING_TARGET"
-      emit_pair "if failed port 53 type udp protocol dns for 5 cycles" HIGH 2 dns 60
+      emit_pair "if failed port 53 type udp protocol dns for 5 cycles" HIGH 2 dns 20
       echo
     fi
     # Resolucao de nomes: por ICMP quando disponivel (mais direto e o que o
@@ -1052,7 +1145,7 @@ gen_network_checks() {
       echo "# Verificado no Monit 5.33: nome nao resolvivel NAO impede o"
       echo "# carregamento da configuracao - a resolucao ocorre em runtime."
       echo "check host resolucao with address $RESOLVE_NAME"
-      emit_pair "if failed ping count 3 with timeout 5 seconds for 5 cycles" HIGH 2 pingname 60
+      emit_pair "if failed ping count 3 with timeout 5 seconds for 5 cycles" HIGH 2 pingname 20
       echo
     fi
     echo "# O RESOLVER DESTE HOST funciona? Testa /etc/resolv.conf,"
@@ -1061,7 +1154,7 @@ gen_network_checks() {
     echo "# a configuracao se o DNS estiver fora no momento do reload."
     echo "check program dns-resolver with path \"$BIN_DIR/ilert-dns.sh\""
     echo "  every 5 cycles"
-    emit_pair "if status != 0 for 3 cycles" HIGH 2 resolver 60
+    emit_pair "if status != 0 for 3 cycles" HIGH 2 resolver 20
   } > /tmp/02-network.conf
   write_file "$CONF_D/02-network.conf" 0600 < /tmp/02-network.conf
   rm -f /tmp/02-network.conf
@@ -1102,7 +1195,7 @@ ensure_monit_sandbox() {
   done
   mapfile -t rw < <(printf '%s\n' "${rw[@]}" | sort -u)
 
-  run mkdir -p /var/lib/ilert/pending /etc/systemd/system/monit.service.d
+  run mkdir -p /var/lib/ilert/pending /var/lib/ilert/crit /etc/systemd/system/monit.service.d
   write_file /etc/systemd/system/monit.service.d/ilert.conf 0644 <<EOF
 # Gerado por install-monit-ilert.sh v$SCRIPT_VERSION
 # Sem isto, com ProtectSystem=$prot, o Monit nao conecta em sockets unix e o
@@ -1128,12 +1221,12 @@ gen_flush_check() {
     echo
     echo "check program ilert-flush with path \"$BIN_DIR/ilert-flush.sh\""
     echo "  every 1 cycles"
-    emit_pair "if status != 0 for 5 cycles" HIGH 2 flush 60
+    emit_pair "if status != 0 for 5 cycles" HIGH 2 flush 20
   } > /tmp/04-flush.conf
   write_file "$CONF_D/04-flush.conf" 0600 < /tmp/04-flush.conf
   rm -f /tmp/04-flush.conf
-  run mkdir -p /var/lib/ilert/pending
-  run chmod 700 /var/lib/ilert /var/lib/ilert/pending
+  run mkdir -p /var/lib/ilert/pending /var/lib/ilert/crit
+  run chmod 700 /var/lib/ilert /var/lib/ilert/pending /var/lib/ilert/crit
 }
 
 gen_heartbeat_check() {
@@ -1147,7 +1240,7 @@ gen_heartbeat_check() {
     echo
     echo "check program ilert-heartbeat with path \"$BIN_DIR/ilert-beat.sh\""
     echo "  every 5 cycles"
-    emit_pair "if status != 0 for 3 cycles" HIGH 2 beat 60
+    emit_pair "if status != 0 for 3 cycles" HIGH 2 beat 20
   } > /tmp/03-heartbeat.conf
   write_file "$CONF_D/03-heartbeat.conf" 0600 < /tmp/03-heartbeat.conf
   rm -f /tmp/03-heartbeat.conf
@@ -1262,7 +1355,7 @@ gen_service_checks() {
     esac
   }
 
-  local s pid cn
+  local s pid cn nport aport mport gport rport
   for s in "${CHOSEN[@]}"; do
     cn="$(uniq_name "$s")"; register_name "$cn"
     case "$s" in
@@ -1275,8 +1368,15 @@ gen_service_checks() {
           echo "  stop  program = \"/bin/systemctl stop nginx\" with timeout 30 seconds"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
           restart_ok "$s" && emit_restart_policy "$cn"
-          emit_pair "if failed port 80 protocol http request \"/\" for 3 cycles" HIGH 2 http 30
-          emit_pair "if cpu > 80% for 10 cycles" "$WARN_PRIO" 3 cpu 120
+          nport="$(pick_port 80 'nginx')"
+          if [ -n "$nport" ]; then
+            [ "$nport" = 80 ] || warn "nginx nao escuta na 80 - usando $nport"
+            emit_pair "if failed port $nport protocol http request \"/\" for 3 cycles" HIGH 2 "http${nport}" 10
+          else
+            echo "  # nginx nao escuta em nenhuma porta TCP (so unix socket?)."
+            echo "  # Nenhum teste de porta gerado - veja 'ss -lntp | grep nginx'."
+          fi
+          emit_pair "if cpu > 80% for 10 cycles" "$WARN_PRIO" 3 cpu 20
           echo
         } >> "$out"
         ;;
@@ -1290,8 +1390,14 @@ gen_service_checks() {
           echo "  stop  program = \"/bin/systemctl stop $s\" with timeout 30 seconds"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
           restart_ok "$s" && emit_restart_policy "$cn"
-          emit_pair "if failed port 80 protocol http request \"/\" for 3 cycles" HIGH 2 http 30
-          emit_pair "if children > 250 for 5 cycles" "$WARN_PRIO" 3 children 120
+          aport="$(pick_port 80 'apache2|httpd')"
+          if [ -n "$aport" ]; then
+            [ "$aport" = 80 ] || warn "$s nao escuta na 80 - usando $aport"
+            emit_pair "if failed port $aport protocol http request \"/\" for 3 cycles" HIGH 2 "http${aport}" 10
+          else
+            echo "  # $s nao escuta em porta TCP - teste de porta omitido."
+          fi
+          emit_pair "if children > 250 for 5 cycles" "$WARN_PRIO" 3 children 20
           echo
         } >> "$out"
         ;;
@@ -1306,8 +1412,15 @@ gen_service_checks() {
           echo "  # banco: nunca reinicie sozinho. Alerta e humano decide."
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
           restart_ok "$s" && emit_restart_policy "$cn"
-          emit_pair "if failed host 127.0.0.1 port 3306 protocol mysql for 3 cycles" HIGH 1 port 30
-          emit_pair "if memory > 70% for 10 cycles" "$WARN_PRIO" 3 mem 120
+          mport="$(pick_port 3306 'mysqld|mariadbd')"
+          if [ -n "$mport" ]; then
+            [ "$mport" = 3306 ] || warn "$s escuta na $mport, nao na 3306"
+            emit_pair "if failed host 127.0.0.1 port $mport protocol mysql for 3 cycles" HIGH 1 "port${mport}" 10
+          else
+            echo "  # sem porta TCP em escuta (bind-address comentado?):"
+            echo "  # apenas o PID e checado. Confira 'ss -lntp | grep -i sql'."
+          fi
+          emit_pair "if memory > 70% for 10 cycles" "$WARN_PRIO" 3 mem 20
           echo
         } >> "$out"
         ;;
@@ -1325,8 +1438,14 @@ gen_service_checks() {
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
           # $pgname, nao $cn: o unmonitor precisa mirar o nome real do check
           restart_ok "$s" && emit_restart_policy "$pgname"
-          emit_pair "if failed host 127.0.0.1 port 5432 protocol pgsql for 3 cycles" HIGH 1 port 30
-          emit_pair "if memory > 70% for 10 cycles" "$WARN_PRIO" 3 mem 120
+          gport="$(pick_port 5432 'postgres')"
+          if [ -n "$gport" ]; then
+            [ "$gport" = 5432 ] || warn "postgres escuta na $gport, nao na 5432"
+            emit_pair "if failed host 127.0.0.1 port $gport protocol pgsql for 3 cycles" HIGH 1 "port${gport}" 10
+          else
+            echo "  # sem porta TCP em escuta - apenas o PID e checado."
+          fi
+          emit_pair "if memory > 70% for 10 cycles" "$WARN_PRIO" 3 mem 20
           echo
         } >> "$out"
         ;;
@@ -1340,7 +1459,7 @@ gen_service_checks() {
           echo "  # sem restart automatico: derrubaria todos os containers"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
           restart_ok "$s" && emit_restart_policy "$cn"
-          emit_pair "if failed unixsocket /var/run/docker.sock for 3 cycles" HIGH 1 socket 30
+          emit_pair "if failed unixsocket /var/run/docker.sock for 3 cycles" HIGH 1 socket 10
           echo
         } >> "$out"
         ;;
@@ -1388,7 +1507,7 @@ gen_service_checks() {
             # extra, gerando sufixos como "sock_php8_2_fpm_".
             sname="$(printf '%s' "$(basename "$c" .sock)" | tr -c 'a-zA-Z0-9_' '_')"
             echo "  # pool: $c"
-            emit_pair "if failed unixsocket $c for 3 cycles" HIGH 1 "sock_${sname}" 30
+            emit_pair "if failed unixsocket $c for 3 cycles" HIGH 1 "sock_${sname}" 10
           done
           for c in ${pports[@]+"${pports[@]}"}; do
             echo "  # pool TCP: porta $c"
@@ -1399,8 +1518,8 @@ gen_service_checks() {
             echo "  # nenhum socket/porta de pool encontrado - so o PID e checado."
             echo "  # Verifique 'listen =' em $pooldir/*.conf e adicione a mao."
           fi
-          emit_pair "if children > 200 for 5 cycles" "$WARN_PRIO" 3 children 120
-          emit_pair "if total memory > 60% for 10 cycles" "$WARN_PRIO" 3 mem 120
+          emit_pair "if children > 200 for 5 cycles" "$WARN_PRIO" 3 children 20
+          emit_pair "if total memory > 60% for 10 cycles" "$WARN_PRIO" 3 mem 20
           echo
         } >> "$out"
         ;;
@@ -1422,14 +1541,18 @@ gen_service_checks() {
           echo "  # reiniciar as cegas pode perder dados nao salvos no RDB/AOF"
           emit_pair "if does not exist for 2 cycles" HIGH 1 pid
           restart_ok "$s" && emit_restart_policy "$cn"
-          emit_pair "if failed host 127.0.0.1 port 6379 type tcp protocol redis for 3 cycles" \
-            HIGH 1 port 30
+          rport="$(pick_port 6379 'redis|valkey')"
+          if [ -n "$rport" ]; then
+            [ "$rport" = 6379 ] || warn "$s escuta na $rport, nao na 6379"
+            emit_pair "if failed host 127.0.0.1 port $rport type tcp protocol redis for 3 cycles" \
+              HIGH 1 "port${rport}" 30
+          fi
           if [ -n "$rsock" ]; then
-            emit_pair "if failed unixsocket $rsock for 3 cycles" HIGH 2 socket 30
+            emit_pair "if failed unixsocket $rsock for 3 cycles" HIGH 2 socket 10
           fi
           echo "  # Redis estourando memoria comeca a evictar chaves em silencio"
-          emit_pair "if memory > 70% for 10 cycles" "$WARN_PRIO" 3 mem 120
-          emit_pair "if cpu > 80% for 10 cycles" "$WARN_PRIO" 3 cpu 120
+          emit_pair "if memory > 70% for 10 cycles" "$WARN_PRIO" 3 mem 20
+          emit_pair "if cpu > 80% for 10 cycles" "$WARN_PRIO" 3 cpu 20
           echo
         } >> "$out"
         ;;
@@ -1552,6 +1675,12 @@ gen_port_checks() {
       case " ${used[*]-} " in *" $cname "*) cname="${name}_${port}" ;; esac
       used+=("$cname")
       printf '  %-24s %s:%s%s\n' "$cname" "$host" "$port" "${proto:+ ($proto)}" >&2
+      # Aviso, nao bloqueio: o alvo pode ser remoto ou subir depois. Mas se o
+      # operador digitou a porta errada, ele descobre agora e nao pelo alerta.
+      case "$host" in
+        127.0.0.1|localhost|::1)
+          port_listening "$port" || warn "    nada escutando em $host:$port agora" ;;
+      esac
       echo "check host $cname with address $host"
       emit_pair "if failed port $port type tcp${proto:+ protocol $proto} with timeout 5 seconds for 3 cycles" \
         HIGH 2 "port${port}" 30
