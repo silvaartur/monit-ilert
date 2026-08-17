@@ -126,6 +126,8 @@ sudo monit status
 | docker | PID, unixsocket | **não, deliberado** |
 | php\*-fpm | PID, unixsocket, children, memória total | não |
 
+**As portas são verificadas antes de virarem check.** O instalador consulta `ss`/`netstat` e usa a porta em que o serviço realmente escuta: se o nginx está na 8080, o check vai para a 8080 e não para a 80. Quando o serviço não escuta em TCP nenhum (só socket unix), o teste de porta é omitido com um comentário no arquivo, em vez de gerar um alerta que nunca se resolve. Portas passadas em `--ports` apontando para localhost também são conferidas, com aviso quando nada responde.
+
 A versão do PHP-FPM é detectada sozinha, então 7.x, 8.x e futuras funcionam sem alteração.
 
 ### Auto-restart
@@ -241,7 +243,7 @@ Os defaults saem do hardware, não de números redondos:
 
 - **Load**: warning em 1×`nproc`, critical em 2×`nproc`, sempre na média de 5min (a de 1min dispara em qualquer `apt upgrade`)
 - **Memória**: escalonada pela RAM total — hosts pequenos recebem limiar mais apertado
-- **Disco**: percentual **e** espaço livre em MB simultaneamente, ambos derivados do tamanho do volume. 10% de 4 TB são 400 GB (tranquilo); 10% de 20 GB são 2 GB (crítico). Volumes pequenos como `/boot` usam piso de 512 MB no warning — o suficiente para instalar um kernel — em vez de um valor fixo em GB que alertaria desde o primeiro dia
+- **Disco**: **um** limiar por nível, em MB livres. Percentual e valor absoluto medem a mesma coisa em unidades diferentes — manter os dois geraria sempre dois alertas para o mesmo disco. A regra percentual é convertida para MB e vale a que dispara primeiro: em volume grande o percentual vence (12% de 4 TB são 480 GB), em volume pequeno o piso absoluto vence (20% de 2 GB são 400 MB, apertado para instalar um kernel). O arquivo gerado traz o percentual equivalente em comentário
 - **Swap**: warning em 10%, critical em 30%, com debounce longo de propósito. Swap pontual durante backup é normal; o que importa é swap que **não volta**. Ajuste com `--swap-warn` / `--swap-crit`
 
 Depois de 1–2 semanas rodando, ajuste com dados reais: instale `sysstat` e use **p95 + 20%** como warning.
@@ -255,6 +257,24 @@ Todo alerta chega no formato `<host> / <serviço>: <descrição>`.
 **Warning de recurso é `LOW`** — load, memória, swap, disco e CPU nos limiares de aviso. Registra no ilert, aparece na lista e no app, mas não escala. Sem isso, disco em 86% e disco em 96% geram dois alertas `HIGH` do mesmo assunto e acordam alguém duas vezes pelo mesmo problema.
 
 Para voltar ao comportamento anterior: `--warn-priority HIGH`.
+
+### Bandas exclusivas: warning e crítico nunca juntos
+
+Os dois testes do Monit **se sobrepõem** — `swap > 10%` continua verdadeiro com swap em 40%, então ambos disparam. O Monit não tem condição de faixa: `if X > 10% and X < 30%` passa no `monit -t`, mas é avaliado como dois testes independentes e dispara com qualquer valor abaixo de 30%.
+
+A exclusividade é feita no `ilert.sh`, com um marcador em disco:
+
+| Evento | Efeito |
+|---|---|
+| `ALERT` `-crit` | grava marcador, fecha o `-warn`, envia o `HIGH` |
+| `ALERT` `-warn` | se o marcador existe, **não envia** — o crítico está no comando |
+| `RESOLVE` `-crit` | apaga o marcador; o `-warn` volta a emitir no próximo `repeat` |
+
+Assim a prioridade sempre reflete a faixa atual, subindo e descendo. Ao sair da faixa crítica, o warning reaparece na próxima janela de repetição (até 20 minutos), já que o Monit só reporta na mudança de estado ou no `repeat`.
+
+O marcador expira em 2 horas (`ILERT_CRIT_TTL`). Um crítico ativo o regrava a cada `repeat`, então só um marcador órfão — deixado por um Monit parado, check removido ou serviço em `unmonitor` — chega a envelhecer. Sem isso, o warning ficaria silenciado para sempre e ninguém perceberia.
+
+Não consulta a API: o marcador tem a mesma informação, sem rede, sem credencial extra no host e sem latência no caminho do alerta.
 
 ### O crítico absorve o warning
 
@@ -271,6 +291,14 @@ Um serviço em crash loop geraria pares ALERT/RESOLVE. Como cada RESOLVE fecha o
 A solução é adiar o RESOLVE. Ele vira um marcador em `/var/lib/ilert/pending/` e só é despachado pelo `ilert-flush.sh` se o serviço continuar de pé por `ILERT_RESOLVE_DELAY` segundos (padrão 300). Se cair de novo antes disso, o ALERT cancela o pendente e o alerta original segue aberto acumulando eventos na timeline.
 
 **Crash loop vira um alerta, não trinta.** Ajuste ou desative em `/etc/ilert.env` com `ILERT_RESOLVE_DELAY=0`.
+
+O adiamento vale só para checks sujeitos a flapping — processo, porta, socket, HTTP, heartbeat. Métricas de recurso (disco, swap, memória, load, CPU) resolvem na hora: não oscilam em segundos, e segurar o fechamento apenas atrasaria a boa notícia.
+
+### Prioridade não é reavaliada
+
+O ilert aplica a prioridade na **criação** do alerta. Um segundo evento com `priority` diferente atualiza a severidade, mas não a prioridade nem o título — a documentação confirma que elevar de Low para High é ação manual (botão *Raise*), e o summary do evento só vira summary do alerta quando um alerta novo é criado.
+
+Por isso a escalada acontece por **degraus**: o teste crítico tem `alertKey` próprio e nasce `HIGH`. Warnings reemitem a cada 20 ciclos e críticos a cada 10, para a timeline refletir o valor atual sem virar spam.
 
 ## Recomendado no ilert
 
