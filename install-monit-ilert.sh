@@ -60,7 +60,7 @@
 #===============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="2.20.1"
+SCRIPT_VERSION="2.21.2"
 BIN_DIR="/usr/local/bin"
 ENV_FILE="/etc/ilert.env"
 API_URL="https://api.ilert.com/api/events"
@@ -1169,47 +1169,97 @@ gen_network_checks() {
 #   2. o ilert.sh nao consegue gravar os marcadores de resolve adiado, e o
 #      anti-flapping para de funcionar sem avisar.
 ensure_monit_sandbox() {
-  local prot
+  local prot caps needs=0
   prot="$(systemctl show monit -p ProtectSystem --value 2>/dev/null || true)"
+  caps="$(systemctl show monit -p CapabilityBoundingSet --value 2>/dev/null || true)"
+
+  # --- 1. /run e /var somente-leitura? ---
+  local -a rw=()
   case "$prot" in
-    strict|full|yes) ;;
-    *) return 0 ;;
+    strict|full|yes)
+      needs=1
+      warn "monit roda com ProtectSystem=$prot (/run e /var somente-leitura)"
+      # Diretorios extraidos dos checks JA GERADOS, nao de lista fixa: um pool
+      # php-fpm ou Redis com 'listen' fora do padrao ficaria de fora.
+      # O prefixo '-' torna cada caminho OPCIONAL: sem ele, um diretorio
+      # inexistente no start impede o monit de iniciar.
+      rw=("-/var/lib/ilert")
+      local d
+      while read -r d; do
+        [ -n "$d" ] && rw+=("-$d")
+      done < <(grep -horE 'unixsocket[[:space:]]+[^[:space:]]+' "$CONF_D"/*.conf 2>/dev/null \
+               | awk '{print $2}' | xargs -r -n1 dirname 2>/dev/null | sort -u || true)
+      # Diretorio entra como esta; arquivo (docker.sock) entra pelo seu
+      # diretorio pai. O truque antigo 'dirname "$d/x"' devolvia o proprio
+      # arquivo quando $d nao era diretorio, gerando entradas como
+      # ReadWritePaths=-/var/run/docker.sock - inutil, porque o que precisa
+      # ser gravavel e o diretorio que contem o socket.
+      for d in /run/php /run/mysqld /run/postgresql /run/redis \
+               /var/run/docker.sock /run/docker.sock; do
+        [ -e "$d" ] || continue
+        if [ -d "$d" ]; then rw+=("-$d"); else rw+=("-$(dirname "$d")"); fi
+      done
+      mapfile -t rw < <(printf '%s\n' "${rw[@]}" | sort -u)
+      ;;
   esac
+
+  # --- 2. faltam grupos para conectar nos sockets? ---
+  # Conectar a um socket unix exige permissao de ESCRITA no arquivo. Os sockets
+  # do php-fpm sao tipicamente www-data:www-data 0660. Root so ignora permissao
+  # de arquivo com CAP_DAC_OVERRIDE - e a unit do monit no Debian/Ubuntu vem com
+  # CapabilityBoundingSet restrito, sem essa capability. Resultado: "Cannot
+  # create unix socket ... Permission denied" com o servico perfeitamente vivo,
+  # enquanto todo teste TCP passa. Entrar no grupo do socket resolve sem
+  # devolver poder de escrita sobre o sistema inteiro.
+  local -a grupos=()
+  if [ -n "$caps" ] && ! printf '%s' "$caps" | grep -qi 'cap_dac_override'; then
+    local sock grp mode
+    while read -r sock; do
+      [ -S "$sock" ] || continue
+      grp="$(stat -c '%G' "$sock" 2>/dev/null || true)"
+      mode="$(stat -c '%a' "$sock" 2>/dev/null || true)"
+      # Bit de escrita do GRUPO: e o penultimo digito, e o bit vale 2 -
+      # entao 2, 3, 6 e 7 tem escrita. Extrair por posicao (nao por padrao
+      # '?6?') porque modos com setgid tem 4 digitos, como 2660, e o padrao
+      # de 3 caracteres deixaria esse caso passar despercebido.
+      case "${mode: -2:1}" in
+        2|3|6|7) [ -n "$grp" ] && [ "$grp" != root ] && grupos+=("$grp") ;;
+      esac
+    done < <(grep -horE 'unixsocket[[:space:]]+[^[:space:]]+' "$CONF_D"/*.conf 2>/dev/null \
+             | awk '{print $2}' | sort -u || true)
+    if [ ${#grupos[@]} -gt 0 ]; then
+      mapfile -t grupos < <(printf '%s\n' "${grupos[@]}" | sort -u)
+      needs=1
+      warn "monit sem CAP_DAC_OVERRIDE e sockets pertencem a: ${grupos[*]}"
+    fi
+  fi
+
+  [ "$needs" -eq 1 ] || return 0
   head1 "9c. Sandbox do systemd"
-  warn "monit roda com ProtectSystem=$prot (/run e /var somente-leitura)"
 
-  # Os diretorios sao extraidos dos checks JA GERADOS, nao de uma lista fixa:
-  # um pool php-fpm ou um Redis com 'listen' fora do padrao ficaria de fora.
-  # O prefixo '-' torna cada caminho OPCIONAL: sem ele, um diretorio que nao
-  # exista no momento do start impede o monit de iniciar
-  # ("Failed to set up mount namespacing"). Sockets em /run somem no boot.
-  local -a rw=("-/var/lib/ilert")
-  local d
-  while read -r d; do
-    [ -n "$d" ] && rw+=("-$d")
-  done < <(grep -horE 'unixsocket[[:space:]]+[^[:space:]]+' "$CONF_D"/*.conf 2>/dev/null \
-           | awk '{print $2}' | xargs -r -n1 dirname 2>/dev/null | sort -u || true)
-  # sockets que o Monit acessa sem a palavra 'unixsocket' (docker, protocolos)
-  for d in /run/php /run/mysqld /run/postgresql /run/redis /var/run/docker.sock; do
-    [ -e "$d" ] && rw+=("-$(dirname "$d/x")")
-  done
-  mapfile -t rw < <(printf '%s\n' "${rw[@]}" | sort -u)
-
-  run mkdir -p /var/lib/ilert/pending /var/lib/ilert/crit /etc/systemd/system/monit.service.d
-  write_file /etc/systemd/system/monit.service.d/ilert.conf 0644 <<EOF
-# Gerado por install-monit-ilert.sh v$SCRIPT_VERSION
-# Sem isto, com ProtectSystem=$prot, o Monit nao conecta em sockets unix e o
-# anti-flapping do ilert nao consegue gravar seus marcadores.
-[Service]
-ReadWritePaths=${rw[*]}
-EOF
+  run mkdir -p /var/lib/ilert/pending /var/lib/ilert/crit \
+      /etc/systemd/system/monit.service.d
+  {
+    echo "# Gerado por install-monit-ilert.sh v$SCRIPT_VERSION"
+    echo "[Service]"
+    if [ ${#rw[@]} -gt 0 ]; then
+      echo "# ProtectSystem=$prot deixa /run e /var somente-leitura para o monit."
+      echo "ReadWritePaths=${rw[*]}"
+    fi
+    if [ ${#grupos[@]} -gt 0 ]; then
+      echo "# Sem CAP_DAC_OVERRIDE, nem root conecta em socket 0660 de outro"
+      echo "# grupo. Entrar no grupo e o caminho de menor privilegio."
+      echo "SupplementaryGroups=${grupos[*]}"
+    fi
+  } > /tmp/ilert-dropin.conf
+  write_file /etc/systemd/system/monit.service.d/ilert.conf 0644 < /tmp/ilert-dropin.conf
+  rm -f /tmp/ilert-dropin.conf
   run systemctl daemon-reload
   SANDBOX_DROPIN=1
-  ok "ReadWritePaths: ${rw[*]}"
-  # O restart NAO acontece aqui: a configuracao ainda nao passou pelo
-  # 'monit -t'. Se ela estiver quebrada, o monit nao subiria e a culpa cairia
-  # no drop-in, que seria removido sem motivo. Quem reinicia e valida o
-  # resultado e o validate_and_start, depois da configuracao aprovada.
+  [ ${#rw[@]} -gt 0 ]     && ok "ReadWritePaths: ${rw[*]}"
+  [ ${#grupos[@]} -gt 0 ] && ok "SupplementaryGroups: ${grupos[*]}"
+  # O restart e a validacao ficam no validate_and_start, depois do 'monit -t'.
+  return 0
 }
 
 gen_flush_check() {
@@ -1797,19 +1847,20 @@ post_install_check() {
   printf '%s\n' "$failed" | sed 's/^/    /'
   # Diagnostico do caso mais comum e mais dificil de adivinhar
   if printf '%s\n' "$failed" | grep -qi 'connection failed'; then
-    local prot
+    local prot caps rwp grps
     prot="$(systemctl show monit -p ProtectSystem --value 2>/dev/null || true)"
-    case "$prot" in
-      strict|full|yes)
-        warn "ProtectSystem=$prot ativo: /run fica somente-leitura para o monit"
-        warn "e conectar em socket unix exige escrita no arquivo do socket."
-        warn "Confira 'systemctl show monit -p ReadWritePaths' e reinstale se vazio."
-        ;;
-      *)
-        warn "'Connection failed' em socket/porta: confira se o servico escuta"
-        warn "no caminho configurado (ss -lx | grep <socket>)."
-        ;;
-    esac
+    caps="$(systemctl show monit -p CapabilityBoundingSet --value 2>/dev/null || true)"
+    rwp="$(systemctl show monit -p ReadWritePaths --value 2>/dev/null || true)"
+    grps="$(systemctl show monit -p SupplementaryGroups --value 2>/dev/null || true)"
+    warn "diagnostico de 'Connection failed':"
+    warn "  ProtectSystem=$prot | ReadWritePaths=${rwp:-<vazio>}"
+    warn "  Capabilities=${caps:-<irrestrito>} | Grupos=${grps:-<nenhum>}"
+    if [ -n "$caps" ] && ! printf '%s' "$caps" | grep -qi 'cap_dac_override'; then
+      warn "  Sem CAP_DAC_OVERRIDE: nem root conecta em socket 0660 de outro"
+      warn "  grupo. Confira o dono dos sockets com 'ls -l /run/php/'."
+    fi
+    warn "  O log do monit traz a causa exata, uma linha ANTES do erro:"
+    warn "  grep -B1 'failed protocol test' /var/log/monit.log | tail -4"
   fi
   warn "corrija antes que virem alerta: cada check falhando abre um alerta"
 }
